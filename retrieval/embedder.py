@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+from typing import Sequence
+
+import numpy as np
+from sklearn.feature_extraction.text import HashingVectorizer
+
+
+class Embedder:
+    def __init__(self, model_name: str, use_sentence_transformers: bool = True) -> None:
+        self.model_name = model_name
+        self.use_sentence_transformers = use_sentence_transformers
+        self._st_model = None
+        self._vectorizer = HashingVectorizer(n_features=768, alternate_sign=False, norm=None)
+
+        if use_sentence_transformers:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                self._st_model = SentenceTransformer(model_name)
+            except Exception:
+                self._st_model = None
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+
+        if self._st_model is not None:
+            arr = self._st_model.encode(list(texts), convert_to_numpy=True, normalize_embeddings=True)
+            return arr.astype(np.float32)
+
+        sparse = self._vectorizer.transform(list(texts))
+        dense = sparse.toarray().astype(np.float32)
+        norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-8
+        return dense / norms

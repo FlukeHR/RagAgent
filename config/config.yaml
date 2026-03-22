@@ -1,0 +1,27 @@
+project:
+  name: code-rag-agent
+  data_root: ./data
+  default_repo: fastapi
+
+index:
+  index_root: ./data/indexes
+  chunk_size: 120
+  chunk_overlap: 20
+  top_k_recall: 12
+  top_n_rerank: 5
+
+embedding:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  use_sentence_transformers: true
+
+rerank:
+  model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+  use_cross_encoder: false
+
+llm:
+  provider: local
+  model_name: qwen2.5-coder
+  temperature: 0.2
+  max_tokens: 768
+  openai_api_base: ""
+  openai_api_key: ""

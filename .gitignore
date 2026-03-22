@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Runtime index artifacts
+/data/indexes/**
+
+# Local logs
+*.log
