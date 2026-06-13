@@ -11,7 +11,9 @@ class Embedder:
         self.model_name = model_name
         self.use_sentence_transformers = use_sentence_transformers
         self._st_model = None
-        self._vectorizer = HashingVectorizer(n_features=768, alternate_sign=False, norm=None)
+        # 回退维度与默认嵌入模型 all-MiniLM-L6-v2 对齐（384），避免建索引与
+        # 查询分别走 ST / 哈希两条路径时维度不一致导致 faiss 维度断言失败
+        self._vectorizer = HashingVectorizer(n_features=384, alternate_sign=False, norm=None)
 
         if use_sentence_transformers:
             try:

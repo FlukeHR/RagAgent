@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from api.routes import router
 
-app = FastAPI(title="Code RAG Agent", version="0.1.0")
+app = FastAPI(title="Paper RAG Agent", version="0.2.0")
 app.include_router(router)
 
 

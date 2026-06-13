@@ -1,37 +1,47 @@
-# Code RAG Agent
+# Paper RAG Agent
 
-面向代码仓库的智能问答系统，基于 RAG（检索增强生成）+ Agent 多步推理，实现对本地代码的检索、分析和回答。
+面向**学术论文**的智能问答系统：以 **Claude（Opus 4.8）原生 tool use** 驱动的 Agentic RAG，结合本地论文库语义检索与 arXiv 在线检索，给出**带引用溯源**的回答。
 
-## 功能特性
+## 核心亮点
 
-- 代码语义检索：向量召回 + 可选重排。
-- 多步推理流程：Planner -> Retriever -> Judge -> Generator。
-- 工程化结构：API、Agent、Retrieval、LLM 解耦。
-- 多仓库扩展：支持在 `data/` 下放置多个代码仓库。
-- 评估能力：内置 Recall/MRR/Hit Rate 评估脚本。
+- **真 Agentic RAG**：用 Claude 原生 tool use + adaptive thinking，由模型自主决定调用哪个工具、是否多跳检索、是否改写查询，而非关键词规则。
+- **多源检索**：本地论文库（向量召回 + 可选重排）+ arXiv 在线检索/下载入库。
+- **Corrective RAG（自我纠错）**：检索结果不充分时，模型自动改写查询重试或转向 arXiv。
+- **引用溯源**：答案在关键结论后标注 `[paper_id·章节]`，并返回结构化来源（论文标题、章节、链接）。
+- **PDF 解析 + 章节分块**：PyMuPDF 解析论文，按章节/段落语义切块并保留元数据。
+- **优雅降级**：未配置 `ANTHROPIC_API_KEY` 时自动回退为传统单跳 RAG，便于离线演示。
 
-## 系统流程
+## 系统架构
 
-1. 用户提交问题。
-2. Agent 规划是否需要多跳检索。
-3. 检索模块完成召回和重排。
-4. LLM 根据上下文生成答案。
-5. 返回答案、步骤、证据来源。
+```
+用户问题
+   │
+   ▼
+PaperRAGAgent ── Claude tool-use 循环 ──┐
+   │                                    │ 工具
+   │   ┌────────────────────────────────┴───────────────┐
+   │   ▼                    ▼                            ▼
+ search_local_papers   read_paper_section          search_arxiv
+ (本地向量检索+重排)    (精读某篇某章节)            (arXiv 在线检索/下载)
+   │
+   ▼
+带引用的答案 + 推理步骤 + 来源列表
+```
 
 ## 项目结构
 
 ```text
 RagAgent/
-├── api/                  # FastAPI 服务
-├── agent/                # 推理流程与状态
-├── retrieval/            # 加载、切块、向量、重排、检索
-├── tools/                # Agent 可调用工具
-├── llm/                  # LLM 统一封装
-├── indexing/             # 索引构建与管理
-├── evaluation/           # 评估脚本与数据
-├── frontend/             # Streamlit 页面
-├── config/               # 配置
-├── data/                 # 代码仓库样例与索引
+├── api/            # FastAPI 服务（/ask /collections /ingest_arxiv）
+├── agent/          # PaperRAGAgent（agentic loop）、系统提示
+├── retrieval/      # 论文加载/章节分块/向量/重排/检索
+├── tools/          # Claude 可调用工具：本地检索 / arXiv / 章节精读
+├── llm/            # LLM 统一封装（Anthropic / OpenAI / 本地降级）
+├── indexing/       # 索引构建与集合管理
+├── evaluation/     # 检索评估脚本与数据
+├── frontend/       # Streamlit 页面
+├── config/         # 配置
+├── data/papers/    # 论文集合（每个子目录是一个 collection）
 └── requirements.txt
 ```
 
@@ -43,39 +53,74 @@ RagAgent/
 pip install -r requirements.txt
 ```
 
-### 2. 构建索引
+### 2. 准备论文
+
+把论文（PDF / txt / md）放到某个集合目录下，例如 `data/papers/demo/`。仓库已内置两篇示例（`rag_survey.txt`、`transformer.txt`）。
+
+### 3. 构建索引
 
 ```bash
-python3 indexing/build_index.py
+python3 indexing/build_index.py          # 默认 demo 集合
+python3 indexing/build_index.py demo     # 指定集合
 ```
 
-### 3. 启动 API
+### 4. 配置大模型（启用 Agentic 模式）
+
+支持两类可做工具调用的后端，二选一即可，共用同一个 agentic 循环：
+
+**Claude（Anthropic）**
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# 或用订阅登录：ant auth login（SDK 自动识别 ~/.config/anthropic 凭据）
+```
+
+**OpenAI 兼容（DeepSeek / Qwen / 本地开源模型）** —— 改 `config/config.yaml` 的 `llm` 段：
+
+```yaml
+llm:
+  provider: openai
+  model_name: deepseek-chat                 # 或 qwen-plus / qwen2.5 ...
+  openai_api_base: https://api.deepseek.com  # Qwen: https://dashscope.aliyuncs.com/compatible-mode/v1
+  openai_api_key: ""                         # 或 export OPENAI_API_KEY=...
+```
+
+本地模型示例（Ollama）：先 `ollama pull qwen2.5 && ollama serve`，再设
+`model_name: qwen2.5`、`openai_api_base: http://localhost:11434/v1`、`openai_api_key: ollama`。
+
+未配置任何后端、或后端调用失败时，系统自动降级为本地检索 RAG（不中断请求）。
+
+### 5. 启动 API
 
 ```bash
 uvicorn api.main:app --reload
 ```
 
-### 4. 调用接口
+### 6. 调用接口
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question":"FastAPI 路由是如何定义的？"}'
+  -d '{"question":"RAG 相比纯参数化模型的优势是什么？","collection":"demo"}'
 ```
 
-### 5. 查看仓库列表
+### 7. 从 arXiv 在线入库
 
 ```bash
-curl http://127.0.0.1:8000/repos
+curl -X POST http://127.0.0.1:8000/ingest_arxiv \
+  -H "Content-Type: application/json" \
+  -d '{"query":"retrieval augmented generation","collection":"arxiv","max_results":3}'
 ```
 
-### 6. 运行评估
+下载论文 PDF 到 `data/papers/<collection>/` 并自动重建该集合索引。
+
+### 8. 运行评估
 
 ```bash
-python3 evaluation/eval.py
+python3 evaluation/eval.py demo
 ```
 
-### 7. 启动前端（可选）
+### 9. 启动前端（可选）
 
 ```bash
 streamlit run frontend/streamlit_app.py
@@ -85,47 +130,61 @@ streamlit run frontend/streamlit_app.py
 
 ### `POST /ask`
 
-请求示例：
-
 ```json
-{
-  "question": "FastAPI 中间件是如何工作的？",
-  "repo_name": "fastapi"
-}
+{ "question": "自注意力是如何工作的？", "collection": "demo" }
 ```
 
-响应示例：
+响应：
 
 ```json
 {
-  "repo_name": "fastapi",
+  "collection": "demo",
   "answer": "...",
-  "steps": ["Planner: multi-hop=True", "Retriever: hop=1, got=5"],
+  "steps": ["Planner: 启动 Claude agentic 检索循环", "Tool[search_local_papers] ..."],
   "sources": [
     {
-      "file_path": ".../data/fastapi/middleware.py",
-      "start_line": 1,
-      "end_line": 10,
-      "score": 0.91
+      "paper_id": "transformer",
+      "paper_title": "Attention Is All You Need: ...",
+      "section": "2 Method",
+      "source": ".../data/papers/demo/transformer.txt",
+      "score": 0.87
     }
   ]
 }
 ```
 
-### `GET /repos`
+### `GET /collections`
 
-返回 `data/` 下可用仓库列表。
+返回 `data/papers/` 下可用论文集合。
+
+### `POST /ingest_arxiv`
+
+```json
+{ "query": "...", "collection": "arxiv", "max_results": 3 }
+```
+
+## Agent 设计
+
+`PaperRAGAgent` 维护一个手写的 agentic 循环（最多 `llm.max_tool_iters` 轮）：
+
+1. 调用 Claude（`tools=[search_local_papers, read_paper_section, search_arxiv]`，adaptive thinking）。
+2. 若返回 `tool_use`：执行对应工具，把结果作为 `tool_result` 回传，并记录 steps 与 sources。
+3. 模型可据检索质量自行改写查询、换工具、多跳，直到 `end_turn` 给出最终答案。
+
+多跳检索、查询改写、Corrective RAG、引用整合都由模型在循环中自然完成。
 
 ## 配置说明
 
-主配置文件是 `config/config.yaml`，关键字段：
+`config/config.yaml` 关键字段：
 
-- `project.default_repo`: 默认检索仓库。
-- `index.chunk_size/chunk_overlap`: 切块策略。
-- `index.top_k_recall/top_n_rerank`: 召回与返回数量。
-- `embedding.use_sentence_transformers`: 是否使用语义嵌入模型。
-- `rerank.use_cross_encoder`: 是否启用 CrossEncoder 重排。
-- `llm.provider`: `local` 或 `openai`。
+- `project.default_collection`：默认论文集合。
+- `index.chunk_size/chunk_overlap`：切块策略（按字符）。
+- `index.top_k_recall/top_n_rerank`：召回与重排数量。
+- `embedding.use_sentence_transformers`：是否使用语义嵌入模型（否则回退哈希向量）。
+- `rerank.use_cross_encoder`：是否启用 CrossEncoder 重排。
+- `llm.provider`：`anthropic` / `openai` / `local`。
+- `llm.model_name` / `effort` / `max_tool_iters`：模型、思考强度、循环上限。
+- `arxiv.max_results` / `download_dir`：arXiv 默认返回数量与下载目录。
 
 ## 许可证
 

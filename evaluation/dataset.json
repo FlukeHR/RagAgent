@@ -1,10 +1,18 @@
 [
   {
-    "question": "FastAPI 路由是如何定义的？",
-    "expected_file_keyword": "data/fastapi/main.py"
+    "question": "What is retrieval-augmented generation and why is it useful?",
+    "expected_paper_keyword": "rag_survey"
   },
   {
-    "question": "中间件执行流程在哪里体现？",
-    "expected_file_keyword": "data/fastapi/middleware.py"
+    "question": "How does a cross-encoder reranker improve retrieval in a RAG pipeline?",
+    "expected_paper_keyword": "rag_survey"
+  },
+  {
+    "question": "How does scaled dot-product self-attention work?",
+    "expected_paper_keyword": "transformer"
+  },
+  {
+    "question": "Why does the Transformer replace recurrence with attention?",
+    "expected_paper_keyword": "transformer"
   }
 ]

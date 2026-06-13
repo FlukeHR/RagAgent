@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from retrieval.chunker import CodeChunk
+from retrieval.chunker import Chunk
 
 
 class Reranker:
@@ -30,9 +30,9 @@ class Reranker:
     def rerank(
         self,
         query: str,
-        candidates: Sequence[tuple[CodeChunk, float]],
+        candidates: Sequence[tuple[Chunk, float]],
         top_n: int,
-    ) -> list[tuple[CodeChunk, float]]:
+    ) -> list[tuple[Chunk, float]]:
         if not candidates:
             return []
 
@@ -47,7 +47,10 @@ class Reranker:
             return [(chunk, float(score)) for chunk, score in ranked[:top_n]]
 
         ranked = sorted(
-            ((chunk, self._token_overlap_score(query, chunk.content) + base_score) for chunk, base_score in candidates),
+            (
+                (chunk, self._token_overlap_score(query, chunk.content) + base_score)
+                for chunk, base_score in candidates
+            ),
             key=lambda x: x[1],
             reverse=True,
         )

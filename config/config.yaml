@@ -1,12 +1,13 @@
 project:
-  name: code-rag-agent
-  data_root: ./data
-  default_repo: fastapi
+  name: paper-rag-agent
+  data_root: ./data/papers
+  default_collection: demo
 
 index:
   index_root: ./data/indexes
-  chunk_size: 120
-  chunk_overlap: 20
+  # 论文按字符窗口切块（尽量落在段落边界），比按行更适合自然语言
+  chunk_size: 900
+  chunk_overlap: 150
   top_k_recall: 12
   top_n_rerank: 5
 
@@ -19,9 +20,15 @@ rerank:
   use_cross_encoder: false
 
 llm:
-  provider: local
-  model_name: qwen2.5-coder
-  temperature: 0.2
-  max_tokens: 768
-  openai_api_base: ""
-  openai_api_key: ""
+  # provider: anthropic | openai | local
+  provider: openai
+  model_name: deepseek/deepseek-v3.2
+  max_tokens: 2048
+  effort: medium          # low | medium | high | xhigh | max
+  max_tool_iters: 6       # agentic loop 最大轮次
+  openai_api_base: "https://api.ofox.ai/v1"
+  openai_api_key: "sk-of-orYCbiIJgaIeYbCqWYlkZkFwAIJgarMiWmwMLrRATNLYxeEsnWQKMZHNXKUjafWX"
+
+arxiv:
+  max_results: 5
+  download_dir: ./data/papers/arxiv

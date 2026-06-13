@@ -11,7 +11,7 @@ import yaml
 class ProjectConfig:
     name: str
     data_root: str
-    default_repo: str
+    default_collection: str
 
 
 @dataclass
@@ -39,10 +39,17 @@ class RerankConfig:
 class LLMConfig:
     provider: str
     model_name: str
-    temperature: float
     max_tokens: int
+    effort: str
+    max_tool_iters: int
     openai_api_base: str
     openai_api_key: str
+
+
+@dataclass
+class ArxivConfig:
+    max_results: int
+    download_dir: str
 
 
 @dataclass
@@ -52,6 +59,7 @@ class Settings:
     embedding: EmbeddingConfig
     rerank: RerankConfig
     llm: LLMConfig
+    arxiv: ArxivConfig
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -73,4 +81,5 @@ def load_settings(path: str | Path | None = None) -> Settings:
         embedding=EmbeddingConfig(**raw["embedding"]),
         rerank=RerankConfig(**raw["rerank"]),
         llm=LLMConfig(**raw["llm"]),
+        arxiv=ArxivConfig(**raw["arxiv"]),
     )

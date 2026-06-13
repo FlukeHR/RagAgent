@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from retrieval.chunker import CodeChunk
+from retrieval.chunker import Chunk
 
 
 class VectorStore:
@@ -18,11 +18,11 @@ class VectorStore:
         self.faiss_path = self.index_dir / "faiss.index"
         self.manifest_path = self.index_dir / "manifest.json"
 
-        self._chunks: list[CodeChunk] = []
+        self._chunks: list[Chunk] = []
         self._vectors: np.ndarray | None = None
         self._faiss_index = None
 
-    def build(self, chunks: list[CodeChunk], vectors: np.ndarray) -> None:
+    def build(self, chunks: list[Chunk], vectors: np.ndarray) -> None:
         if len(chunks) != len(vectors):
             raise ValueError("chunks and vectors length mismatch")
 
@@ -63,10 +63,10 @@ class VectorStore:
                 self._faiss_index = None
 
     @property
-    def chunks(self) -> list[CodeChunk]:
+    def chunks(self) -> list[Chunk]:
         return self._chunks
 
-    def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[CodeChunk, float]]:
+    def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[Chunk, float]]:
         if self._vectors is None or not self._chunks:
             self.load()
 
