@@ -39,7 +39,7 @@ RagAgent/
 ├── llm/            # LLM 统一封装（Anthropic / OpenAI / 本地降级）
 ├── indexing/       # 索引构建与集合管理
 ├── evaluation/     # 检索评估脚本与数据
-├── frontend/       # Streamlit 页面
+├── frontend/web/   # 前端单页（原生 HTML/JS，FastAPI 托管于 /ui）
 ├── config/         # 配置
 ├── data/papers/    # 论文集合（每个子目录是一个 collection）
 └── requirements.txt
@@ -120,11 +120,15 @@ curl -X POST http://127.0.0.1:8000/ingest_arxiv \
 python3 evaluation/eval.py demo
 ```
 
-### 9. 启动前端（可选）
+### 9. 打开网页界面
 
-```bash
-streamlit run frontend/streamlit_app.py
+前端由 API 一并托管，启动第 5 步后直接浏览器打开：
+
 ```
+http://localhost:8000/ui/
+```
+
+类 Claude 的对话界面：底部输入框、聊天历史、答案中**重要句子后内联出现 📄 引用图标**，点击在右侧抽屉弹出对应 PDF 页并高亮原文（非 PDF 来源则显示引用片段）。
 
 ## API 说明
 

@@ -42,13 +42,16 @@ class PaperReaderTool:
             },
         }
 
-    def run(self, paper_id: str, section: str | None = None) -> ToolResult:
+    def run(
+        self, paper_id: str, section: str | None = None, _id_base: int = 0
+    ) -> ToolResult:
         doc = self._load(paper_id)
         if doc is None:
             return ToolResult(
                 text=f"未找到 paper_id={paper_id} 对应的本地论文。", sources=[]
             )
 
+        sid = f"S{_id_base + 1}"
         if not section:
             toc = "\n".join(f"- {s.title}" for s in doc.sections)
             abstract = next(
@@ -56,12 +59,12 @@ class PaperReaderTool:
                 doc.sections[0].text,
             )
             text = (
-                f"《{doc.title}》章节目录:\n{toc}\n\n"
+                f"[{sid}]《{doc.title}》章节目录（引用时用 {sid}）:\n{toc}\n\n"
                 f"摘要/开头:\n{abstract[: self.max_chars]}"
             )
             return ToolResult(
                 text=text,
-                sources=[self._src(doc, "TOC")],
+                sources=[self._src(doc, "TOC", sid, snippet=abstract[:600])],
             )
 
         matched = [s for s in doc.sections if section.lower() in s.title.lower()]
@@ -72,8 +75,8 @@ class PaperReaderTool:
             )
         sec = matched[0]
         return ToolResult(
-            text=f"《{doc.title}》· {sec.title}:\n{sec.text[: self.max_chars]}",
-            sources=[self._src(doc, sec.title)],
+            text=f"[{sid}]《{doc.title}》｜章节 {sec.title}（引用时用 {sid}）:\n{sec.text[: self.max_chars]}",
+            sources=[self._src(doc, sec.title, sid, snippet=sec.text[:600])],
         )
 
     def _load(self, paper_id: str) -> PaperDocument | None:
@@ -84,11 +87,16 @@ class PaperReaderTool:
         return None
 
     @staticmethod
-    def _src(doc: PaperDocument, section: str) -> dict:
+    def _src(
+        doc: PaperDocument, section: str, sid: str, snippet: str | None = None
+    ) -> dict:
         return {
+            "id": sid,
+            "chunk_id": f"{doc.paper_id}::{section}",
             "paper_id": doc.paper_id,
             "paper_title": doc.title,
             "section": section,
             "source": doc.source,
             "score": None,
+            "snippet": snippet,
         }

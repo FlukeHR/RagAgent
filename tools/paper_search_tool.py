@@ -34,7 +34,7 @@ class PaperSearchTool:
             },
         }
 
-    def run(self, query: str) -> ToolResult:
+    def run(self, query: str, _id_base: int = 0) -> ToolResult:
         results = self.retriever.search(query)
         if not results:
             return ToolResult(text="本地论文库未检索到相关片段。", sources=[])
@@ -43,17 +43,21 @@ class PaperSearchTool:
         sources: list[dict] = []
         for i, r in enumerate(results, start=1):
             c = r.chunk
+            sid = f"S{_id_base + i}"  # 全局唯一引用编号，模型据此引用
             blocks.append(
-                f"[来源{i}] 《{c.paper_title}》· {c.section} "
-                f"(paper_id={c.paper_id}, score={r.score:.3f})\n{c.content}"
+                f"[{sid}]《{c.paper_title}》｜章节 {c.section}｜论文ID {c.paper_id}"
+                f"（论文ID 仅供 read_paper_section 调用，引用时请用 {sid}）\n{c.content}"
             )
             sources.append(
                 {
+                    "id": sid,
+                    "chunk_id": c.chunk_id,
                     "paper_id": c.paper_id,
                     "paper_title": c.paper_title,
                     "section": c.section,
                     "source": c.source,
                     "score": round(float(r.score), 4),
+                    "snippet": c.content[:600],  # 供 /preview 在 PDF 中精确定位高亮
                 }
             )
         return ToolResult(text="\n\n".join(blocks), sources=sources)

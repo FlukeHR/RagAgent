@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 
 from agent.graph import PaperRAGAgent
 from api.schemas import (
@@ -49,6 +51,101 @@ def ask(req: AskRequest) -> AskResponse:
         steps=result.steps,
         sources=result.sources,
     )
+
+
+def _search_phrases(snippet: str, max_phrases: int = 6) -> list[str]:
+    """把片段拆成若干短句，用于在 PDF 页内逐句定位（长串易因换行/连字符匹配失败）。"""
+    text = re.sub(r"\s+", " ", snippet).strip()
+    if not text:
+        return []
+    phrases = [
+        p.strip()[:120]
+        for p in re.split(r"(?<=[.!?。！？])\s+", text)
+        if len(p.strip()) >= 15
+    ]
+    return phrases[:max_phrases] or [text[:120]]
+
+
+def _locate(doc, snippet: str) -> tuple[list, int]:
+    """返回 (高亮矩形列表, 0基页码)。逐页统计命中的短句矩形，取覆盖最高的页。
+
+    比"首个命中页"更稳：避免某短句在靠前页偶然出现导致定位到无关页。
+    """
+    phrases = _search_phrases(snippet)
+    if not phrases:
+        return [], 0
+
+    best_rects: list = []
+    best_page = 0
+    best_score = 0
+    for pno in range(len(doc)):
+        page = doc[pno]
+        rects: list = []
+        matched_phrases = 0
+        for ph in phrases:
+            hits = page.search_for(ph)
+            if hits:
+                matched_phrases += 1
+                rects.extend(hits)
+        if matched_phrases > best_score:
+            best_score, best_rects, best_page = matched_phrases, rects, pno
+    return best_rects, best_page
+
+
+def _pdf_path_or_404(collection: str, paper_id: str):
+    settings = load_settings()
+    pdf_path = BASE_DIR / settings.project.data_root / collection / f"{paper_id}.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail=f"无 PDF 可预览: {paper_id}")
+    try:
+        import fitz  # PyMuPDF  # noqa: F401
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="缺少 PyMuPDF") from exc
+    return pdf_path
+
+
+@router.get("/preview/meta")
+def preview_meta(
+    collection: str = Query(...),
+    paper_id: str = Query(...),
+    snippet: str | None = Query(None),
+) -> dict:
+    """返回 PDF 总页数与引用所在页（1 基），供前端加载整份文档并滚动定位。"""
+    import fitz
+
+    pdf_path = _pdf_path_or_404(collection, paper_id)
+    with fitz.open(str(pdf_path)) as doc:
+        match_page = 1
+        if snippet:
+            _, pno = _locate(doc, snippet)
+            match_page = pno + 1
+        return {"pages": len(doc), "match_page": match_page}
+
+
+@router.get("/preview/page")
+def preview_page(
+    collection: str = Query(...),
+    paper_id: str = Query(...),
+    page: int = Query(1, ge=1),
+    snippet: str | None = Query(None),
+    zoom: float = Query(1.6, ge=0.5, le=4.0),
+) -> Response:
+    """渲染 PDF 指定页为 PNG；若该页含引用片段则就地高亮。"""
+    import fitz
+
+    pdf_path = _pdf_path_or_404(collection, paper_id)
+    with fitz.open(str(pdf_path)) as doc:
+        pno = min(page - 1, len(doc) - 1)
+        pg = doc[pno]
+        if snippet:
+            rects: list = []
+            for ph in _search_phrases(snippet):
+                rects.extend(pg.search_for(ph))
+            if rects:
+                pg.add_highlight_annot(rects)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        png = pix.tobytes("png")
+    return Response(content=png, media_type="image/png")
 
 
 @router.get("/collections", response_model=CollectionsResponse)

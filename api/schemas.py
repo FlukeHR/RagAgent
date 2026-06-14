@@ -9,11 +9,14 @@ class AskRequest(BaseModel):
 
 
 class SourceItem(BaseModel):
+    id: str | None = None  # 引用编号，如 S1；前端按它把 [S1] 标记映射到本来源
+    chunk_id: str | None = None
     paper_id: str
     paper_title: str
     section: str
     source: str
     score: float | None = None
+    snippet: str | None = None  # 引用原文片段，前端预览时用于在 PDF 中定位高亮
 
 
 class AskResponse(BaseModel):

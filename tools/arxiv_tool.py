@@ -41,7 +41,11 @@ class ArxivTool:
         }
 
     def run(
-        self, query: str, max_results: int | None = None, download: bool = False
+        self,
+        query: str,
+        max_results: int | None = None,
+        download: bool = False,
+        _id_base: int = 0,
     ) -> ToolResult:
         import arxiv
 
@@ -55,10 +59,11 @@ class ArxivTool:
         sources: list[dict] = []
         for i, result in enumerate(client.results(search), start=1):
             aid = result.get_short_id()
+            sid = f"S{_id_base + i}"
             authors = ", ".join(a.name for a in result.authors[:5])
             summary = " ".join(result.summary.split())
             block = (
-                f"[arXiv{i}] {result.title}\n"
+                f"[{sid}] {result.title}\n"
                 f"作者: {authors}\n"
                 f"发表: {result.published.date()}\n"
                 f"arxiv_id: {aid}  链接: {result.entry_id}\n"
@@ -75,11 +80,14 @@ class ArxivTool:
             blocks.append(block)
             sources.append(
                 {
+                    "id": sid,
+                    "chunk_id": aid,
                     "paper_id": aid,
                     "paper_title": result.title,
                     "section": "Abstract",
                     "source": result.entry_id,
                     "score": None,
+                    "snippet": summary[:600],
                 }
             )
 

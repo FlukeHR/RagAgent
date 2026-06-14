@@ -67,7 +67,7 @@ class PaperRAGAgent:
         return AgentAnswer(
             answer=answer or "未能生成答案。",
             steps=steps,
-            sources=self._dedup_sources(sources),
+            sources=sources,  # 保留每条带唯一 id 的来源，前端按 [S编号] 映射
         )
 
     def _run_tool(
@@ -79,7 +79,8 @@ class PaperRAGAgent:
             steps.append(f"Tool[{name}] 未知工具")
             return ToolOutcome(tool_call, f"未知工具: {name}", is_error=True)
         try:
-            result = self._tools[name].run(**tool_input)
+            # _id_base 让本轮检索到的 chunk 获得跨多次调用全局唯一的 [S编号]
+            result = self._tools[name].run(**tool_input, _id_base=len(sources))
             sources.extend(result.sources)
             steps.append(f"Tool[{name}] {tool_input} -> {len(result.sources)} 来源")
             return ToolOutcome(tool_call, result.text)
@@ -90,12 +91,13 @@ class PaperRAGAgent:
     @staticmethod
     def _summary_prompt(question: str, sources: list[dict]) -> str:
         refs = "\n".join(
-            f"- 《{s['paper_title']}》· {s['section']} (paper_id={s['paper_id']})"
+            f"[{s.get('id', '?')}]《{s['paper_title']}》｜章节 {s['section']}\n{(s.get('snippet') or '')[:300]}"
             for s in sources
         )
         return (
-            "请基于以下已检索到的论文来源，对用户问题给出尽可能完整的回答，"
-            "并在结论后用 [paper_id·章节] 标注引用。\n\n"
+            "请基于以下已检索到的论文来源，对用户问题给出尽可能完整的回答。"
+            "每条来源以 [S编号] 标识，在关键结论后紧跟对应的 [S编号] 标注引用"
+            "（如 [S1]，可连写 [S1][S3]）；只能引用下面出现过的编号，不要使用其他格式。\n\n"
             f"用户问题:\n{question}\n\n已检索来源:\n{refs or '(无)'}\n"
         )
 
@@ -109,22 +111,15 @@ class PaperRAGAgent:
 
         sources = [
             {
+                "id": f"S{i}",
+                "chunk_id": r.chunk.chunk_id,
                 "paper_id": r.chunk.paper_id,
                 "paper_title": r.chunk.paper_title,
                 "section": r.chunk.section,
                 "source": r.chunk.source,
                 "score": round(float(r.score), 4),
+                "snippet": r.chunk.content[:600],
             }
-            for r in results
+            for i, r in enumerate(results, start=1)
         ]
-        return AgentAnswer(answer=answer, steps=steps, sources=self._dedup_sources(sources))
-
-    # ---------- 公共 ----------
-    @staticmethod
-    def _dedup_sources(sources: list[dict]) -> list[dict]:
-        seen: dict[tuple, dict] = {}
-        for s in sources:
-            key = (s.get("paper_id"), s.get("section"))
-            if key not in seen:
-                seen[key] = s
-        return list(seen.values())
+        return AgentAnswer(answer=answer, steps=steps, sources=sources)

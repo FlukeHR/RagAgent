@@ -22,12 +22,12 @@ rerank:
 llm:
   # provider: anthropic | openai | local
   provider: openai
-  model_name: deepseek/deepseek-v3.2
+  model_name: deepseek-v4-flash
   max_tokens: 2048
   effort: medium          # low | medium | high | xhigh | max
   max_tool_iters: 6       # agentic loop 最大轮次
-  openai_api_base: "https://api.ofox.ai/v1"
-  openai_api_key: "sk-of-orYCbiIJgaIeYbCqWYlkZkFwAIJgarMiWmwMLrRATNLYxeEsnWQKMZHNXKUjafWX"
+  openai_api_base: "https://api.deepseek.com"
+  openai_api_key: "sk-cc085cde25db46a78c8a9e04db9e7bfc"
 
 arxiv:
   max_results: 5

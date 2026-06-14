@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Paper RAG Agent</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [["$", "$"], ["\\(", "\\)"]],
+      displayMath: [["$$", "$$"], ["\\[", "\\]"]],
+      processEnvironments: true,
+    },
+    options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"] },
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --border: #e5e5e0; --text: #2d2d2a;
+    --muted: #8a8a82; --accent: #c96442; --accent-soft: #f4e3dc; --user-bg: #ecebe6;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header .title { font-weight: 600; font-size: 15px; }
+  header .spacer { flex: 1; }
+  header select, header button {
+    font-size: 13px; padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  header button:hover { background: var(--bg); }
+
+  /* 主体：左对话 / 右预览 分屏 */
+  #body { flex: 1; display: flex; min-height: 0; }
+  #chatpane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #viewer {
+    width: 0; overflow: hidden; border-left: 1px solid var(--border);
+    background: var(--bg); display: flex; flex-direction: column; transition: width .2s ease;
+  }
+  body.split #viewer { width: 52%; }
+  body.split #chatpane { flex: 0 0 48%; }
+
+  #chat { flex: 1; overflow-y: auto; padding: 24px 0; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+  body.split .wrap { max-width: 100%; }
+
+  .msg { margin-bottom: 26px; }
+  .msg .role { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .msg.user .bubble {
+    background: var(--user-bg); border-radius: 14px; padding: 12px 16px;
+    display: inline-block; white-space: pre-wrap; max-width: 100%;
+  }
+  .msg.assistant .bubble { line-height: 1.7; }
+  .bubble p:first-child { margin-top: 0; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble pre { background: #f0f0ec; padding: 12px; border-radius: 8px; overflow-x: auto; }
+  .bubble code { background: #f0f0ec; padding: 1px 5px; border-radius: 4px; }
+  .bubble pre code { background: none; padding: 0; }
+
+  .cite {
+    cursor: pointer; color: var(--accent); font-size: 11px;
+    background: var(--accent-soft); border-radius: 6px; padding: 1px 5px;
+    margin: 0 2px; vertical-align: super; line-height: 1; user-select: none;
+    border: 1px solid transparent; transition: border-color .15s;
+  }
+  .cite:hover { border-color: var(--accent); }
+
+  .steps { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .steps summary { cursor: pointer; }
+  .steps ul { margin: 6px 0 0; padding-left: 18px; }
+  .typing { color: var(--muted); font-size: 14px; }
+
+  footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 0 18px; }
+  .composer {
+    max-width: 760px; margin: 0 auto; padding: 0 20px;
+    display: flex; gap: 10px; align-items: flex-end;
+  }
+  body.split .composer { max-width: 100%; }
+  .composer textarea {
+    flex: 1; resize: none; border: 1px solid var(--border); border-radius: 14px;
+    padding: 12px 14px; font: inherit; font-size: 15px; line-height: 1.5;
+    max-height: 200px; outline: none; background: var(--panel);
+  }
+  .composer textarea:focus { border-color: var(--accent); }
+  .composer button {
+    border: none; background: var(--accent); color: #fff; border-radius: 12px;
+    width: 44px; height: 44px; font-size: 18px; cursor: pointer; flex-shrink: 0;
+  }
+  .composer button:disabled { opacity: .5; cursor: default; }
+  .hint { max-width: 760px; margin: 6px auto 0; padding: 0 20px; font-size: 11px; color: var(--muted); }
+  body.split .hint { max-width: 100%; }
+
+  /* 右侧 PDF 预览 */
+  .viewer-head {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .viewer-head .vt { font-size: 13px; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .viewer-head button { border: none; background: none; font-size: 20px; cursor: pointer; color: var(--muted); }
+  .viewer-body { flex: 1; overflow-y: auto; padding: 16px; }
+  img.pdfpage {
+    display: block; width: 100%; margin: 0 auto 12px; background: #fff;
+    border-radius: 4px; box-shadow: 0 1px 8px rgba(0,0,0,.12);
+  }
+  .viewer-body .snippet { background: var(--panel); padding: 14px; border-radius: 8px; line-height: 1.7; white-space: pre-wrap; }
+  .viewer-body .note { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="title">📚 Paper RAG Agent</span>
+    <span class="spacer"></span>
+    <select id="collection" title="论文集合"></select>
+    <button id="newchat">新对话</button>
+  </header>
+
+  <div id="body">
+    <section id="chatpane">
+      <div id="chat"><div class="wrap" id="messages"></div></div>
+      <footer>
+        <div class="composer">
+          <textarea id="input" rows="1" placeholder="问点关于论文的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="send" title="发送">↑</button>
+        </div>
+        <div class="hint">引用以 <span class="cite">📄</span> 出现在相关句子后，点击在右侧打开整份 PDF 并定位高亮。</div>
+      </footer>
+    </section>
+
+    <section id="viewer">
+      <div class="viewer-head">
+        <span class="vt" id="viewer-title">来源预览</span>
+        <button id="viewer-close" title="关闭">×</button>
+      </div>
+      <div class="viewer-body" id="viewer-body"></div>
+    </section>
+  </div>
+
+<script>
+const API = "";
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+let messages = JSON.parse(localStorage.getItem("rag_history") || "[]");
+
+// ---------- 初始化 ----------
+async function loadCollections() {
+  try {
+    const r = await fetch(`${API}/collections`);
+    const data = await r.json();
+    const sel = $("collection");
+    sel.innerHTML = "";
+    (data.collections || ["demo"]).forEach(c => {
+      const o = document.createElement("option");
+      o.value = o.textContent = c; sel.appendChild(o);
+    });
+  } catch (e) { /* 后端未启动时静默 */ }
+}
+
+// ---------- 引用 + 公式 渲染 ----------
+const SID_RE = /\[(S\d+)\]/g;
+const OLD_RE = /\[([^\]·\[]+)·([^\]\[]+)\]/g;
+
+function matchSource(sources, pid, sec) {
+  const cands = (sources || []).filter(s => s.paper_id === pid);
+  if (!cands.length) return null;
+  const lc = sec.toLowerCase();
+  return cands.find(s => {
+    const ss = (s.section || "").toLowerCase();
+    return ss && (ss.includes(lc) || lc.includes(ss));
+  }) || cands[0];
+}
+
+function chip(src, collection, title) {
+  const payload = encodeURIComponent(JSON.stringify({ ...src, collection }));
+  return `<sup class="cite" data-src="${payload}" title="${title}">📄</sup>`;
+}
+
+// 把 LaTeX 公式段先挖出来占位，避免被 marked 当成 markdown 破坏，渲染后再放回
+function protectMath(text, store) {
+  const pats = [
+    /\$\$[\s\S]+?\$\$/g, /\\\[[\s\S]+?\\\]/g,
+    /\\begin\{[a-z*]+\}[\s\S]+?\\end\{[a-z*]+\}/g,
+    /\$[^\$\n]+?\$/g, /\\\([\s\S]+?\\\)/g,
+  ];
+  for (const re of pats) {
+    text = text.replace(re, (m) => { store.push(m); return `@@MATH${store.length - 1}@@`; });
+  }
+  return text;
+}
+
+function buildCitedHtml(text, sources, collection) {
+  const idMap = {};
+  (sources || []).forEach(s => { if (s.id) idMap[s.id] = s; });
+
+  let t = (text || "")
+    .replace(SID_RE, (m, id) => {
+      const src = idMap[id];
+      return src ? chip(src, collection, `${src.paper_id} · ${src.section}`) : m;
+    })
+    .replace(OLD_RE, (m, pid, sec) => {
+      pid = pid.replace(/^paper[_\s]?id\s*[=:：]\s*/i, "").trim();
+      sec = sec.replace(/^section\s*[=:：]\s*/i, "").trim();
+      const src = matchSource(sources, pid, sec) || { paper_id: pid, section: sec };
+      return chip(src, collection, `${pid} · ${sec}`);
+    });
+
+  const math = [];
+  t = protectMath(t, math);
+  let html = marked.parse(t);
+  html = html.replace(/@@MATH(\d+)@@/g, (m, i) => math[+i]);
+  return html;
+}
+
+function typesetMath() {
+  if (window.MathJax && MathJax.typesetPromise) {
+    MathJax.typesetPromise([messagesEl]).catch(() => {});
+  }
+}
+
+// ---------- 渲染对话 ----------
+function render() {
+  messagesEl.innerHTML = "";
+  messages.forEach(m => {
+    const div = document.createElement("div");
+    div.className = `msg ${m.role}`;
+    if (m.role === "user") {
+      div.innerHTML = `<div class="role">你</div><div class="bubble"></div>`;
+      div.querySelector(".bubble").textContent = m.content;
+    } else {
+      div.innerHTML = `<div class="role">助手</div><div class="bubble">${buildCitedHtml(m.content, m.sources, m.collection)}</div>`;
+      if (m.steps && m.steps.length) {
+        const d = document.createElement("details");
+        d.className = "steps";
+        d.innerHTML = `<summary>🔎 检索步骤 (${m.steps.length})</summary><ul>${m.steps.map(s => `<li>${escapeHtml(s)}</li>`).join("")}</ul>`;
+        div.appendChild(d);
+      }
+    }
+    messagesEl.appendChild(div);
+  });
+  $("chat").scrollTop = $("chat").scrollHeight;
+  typesetMath();
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+function save() { localStorage.setItem("rag_history", JSON.stringify(messages)); }
+
+// ---------- 发送 ----------
+async function send() {
+  const input = $("input");
+  const q = input.value.trim();
+  if (!q) return;
+  const collection = $("collection").value || "demo";
+
+  messages.push({ role: "user", content: q });
+  input.value = ""; input.style.height = "auto";
+  render(); save();
+  setSending(true);
+
+  const thinking = document.createElement("div");
+  thinking.className = "msg assistant";
+  thinking.innerHTML = `<div class="role">助手</div><div class="typing">正在检索并生成…</div>`;
+  messagesEl.appendChild(thinking);
+  $("chat").scrollTop = $("chat").scrollHeight;
+
+  try {
+    const r = await fetch(`${API}/ask`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q, collection }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      messages.push({ role: "assistant", content: `⚠️ 请求失败 (${r.status})：${t}`, sources: [], steps: [], collection });
+    } else {
+      const data = await r.json();
+      messages.push({
+        role: "assistant", content: data.answer || "(空回答)",
+        sources: data.sources || [], steps: data.steps || [], collection,
+      });
+    }
+  } catch (e) {
+    messages.push({ role: "assistant", content: `⚠️ 网络错误：${e}`, sources: [], steps: [], collection });
+  } finally {
+    setSending(false);
+    render(); save();
+  }
+}
+function setSending(b) { $("send").disabled = b; }
+
+// ---------- 预览（分屏 + 整份 PDF 滚动定位） ----------
+async function openPreview(src) {
+  document.body.classList.add("split");
+  $("viewer-title").textContent = `《${src.paper_title || src.paper_id}》 · ${src.section || ""}`;
+  const body = $("viewer-body");
+  body.innerHTML = `<div class="note">加载中…</div>`;
+
+  const isPdf = (src.source || "").toLowerCase().endsWith(".pdf");
+  if (!isPdf) {
+    body.innerHTML = `<div class="note">该来源不是 PDF，显示引用片段：</div><div class="snippet"></div>`;
+    body.querySelector(".snippet").textContent = src.snippet || "(无片段)";
+    return;
+  }
+
+  const coll = src.collection || "demo";
+  const snippet = src.snippet || "";
+  let meta;
+  try {
+    const r = await fetch(`${API}/preview/meta?` + new URLSearchParams({ collection: coll, paper_id: src.paper_id, snippet }));
+    if (!r.ok) throw new Error(r.status);
+    meta = await r.json();
+  } catch (e) {
+    body.innerHTML = `<div class="note">无法加载 PDF（${e}），显示片段：</div><div class="snippet"></div>`;
+    body.querySelector(".snippet").textContent = src.snippet || "(无片段)";
+    return;
+  }
+
+  body.innerHTML = "";
+  const matchPage = meta.match_page || 1;
+  let target = null;
+  for (let p = 1; p <= meta.pages; p++) {
+    const img = document.createElement("img");
+    img.className = "pdfpage";
+    img.alt = `第 ${p} 页`;
+    img.src = `${API}/preview/page?` + new URLSearchParams({ collection: coll, paper_id: src.paper_id, page: p, snippet, zoom: "1.6" });
+    body.appendChild(img);
+    if (p === matchPage) target = img;
+  }
+  // 打开后首屏定位到高亮页
+  if (target) {
+    const jump = () => target.scrollIntoView({ block: "start" });
+    target.addEventListener("load", jump, { once: true });
+    setTimeout(jump, 400);
+  }
+}
+
+function closeViewer() { document.body.classList.remove("split"); }
+
+// ---------- 事件 ----------
+messagesEl.addEventListener("click", e => {
+  const el = e.target.closest(".cite");
+  if (!el) return;
+  try { openPreview(JSON.parse(decodeURIComponent(el.dataset.src))); } catch (_) {}
+});
+$("viewer-close").addEventListener("click", closeViewer);
+$("send").addEventListener("click", send);
+$("newchat").addEventListener("click", () => { messages = []; save(); render(); closeViewer(); });
+
+const input = $("input");
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 200) + "px";
+});
+
+loadCollections();
+render();
+</script>
+</body>
+</html>
