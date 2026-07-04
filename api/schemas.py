@@ -3,9 +3,19 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class Turn(BaseModel):
+    """对话历史中的一轮（仅纯文本，不含工具内部块）。"""
+
+    role: str = Field(..., description="user | assistant")
+    content: str = Field(..., description="该轮文本内容")
+
+
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="用户问题")
     collection: str | None = Field(None, description="目标论文集合名称")
+    history: list[Turn] = Field(
+        default_factory=list, description="本会话之前的对话轮次，用于历史注入与指代消解"
+    )
 
 
 class SourceItem(BaseModel):
@@ -17,6 +27,7 @@ class SourceItem(BaseModel):
     source: str
     score: float | None = None
     snippet: str | None = None  # 引用原文片段，前端预览时用于在 PDF 中定位高亮
+    collection: str | None = None  # 该来源 PDF 所在集合目录（arXiv 下载的指向 arxiv），供前端预览定位
 
 
 class AskResponse(BaseModel):
@@ -24,6 +35,7 @@ class AskResponse(BaseModel):
     answer: str
     steps: list[str]
     sources: list[SourceItem]
+    trace: list[dict] = []  # 结构化可观测事件（LLM 轮次/工具调用/核查/预算）
 
 
 class CollectionsResponse(BaseModel):
@@ -40,3 +52,11 @@ class IngestArxivResponse(BaseModel):
     collection: str
     downloaded: list[str]
     indexed_chunks: int
+
+
+class TitleRequest(BaseModel):
+    messages: list[Turn] = Field(..., description="用于概括标题的对话轮次（通常是首轮问答）")
+
+
+class TitleResponse(BaseModel):
+    title: str

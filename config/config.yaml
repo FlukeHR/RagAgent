@@ -11,13 +11,25 @@ index:
   top_k_recall: 12
   top_n_rerank: 5
 
+# 模型名写 HF 全名即可：若 models/<名> 下有本地副本则自动优先用本地（离线、可移植），
+# 否则回退在线下载（见 config/settings.py:resolve_model_path）。
 embedding:
   model_name: sentence-transformers/all-MiniLM-L6-v2
   use_sentence_transformers: true
 
 rerank:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
-  use_cross_encoder: false
+  use_cross_encoder: true
+
+retrieval:
+  # 低置信判据：分数先经 sigmoid 归一化为「相关概率」(0~1)，与 reranker 量纲解耦。
+  # 判为低置信（触发有界二次检索）当：最高分概率 < 强阈值，或 概率≥弱阈值的来源不足 min_confident_sources 条。
+  # 下列阈值按 CrossEncoder 开（默认，分数为 CE logit）标定；CE 关（降级 token+余弦≈0~2）需另行重标定。
+  low_confidence_threshold: 0.5    # 强阈值（相关概率）：sigmoid(CE logit=0)=0.5
+  weak_confidence_threshold: 0.35  # 弱阈值（相关概率）
+  min_confident_sources: 1         # 概率≥弱阈值的来源至少这么多条
+  # 引用核查失败 / 低置信时，自动二次检索的最大次数（有界，避免无限多跳）。
+  max_corrections: 1
 
 llm:
   # provider: anthropic | openai | local
@@ -27,8 +39,20 @@ llm:
   effort: medium          # low | medium | high | xhigh | max
   max_tool_iters: 6       # agentic loop 最大轮次
   openai_api_base: "https://api.deepseek.com"
-  openai_api_key: "sk-cc085cde25db46a78c8a9e04db9e7bfc"
+  # 密钥绝不写进此文件：留空，从环境变量 OPENAI_API_KEY 读取（见 llm/model.py）
+  openai_api_key: ""
 
 arxiv:
   max_results: 5
   download_dir: ./data/papers/arxiv
+  full_text_collection: arxiv   # 下载论文入库的共享全文集合（与 download_dir 同一目录）
+  max_ingest_papers: 3          # ingest_arxiv_papers 每轮下载上限（有界）
+  max_pdf_mb: 30                # 单篇 PDF 体积上限（MB），超出跳过
+  ingest_timeout_seconds: 120   # 下载+增量嵌入+重检索的专属超时（含网络/推理）
+  max_collection_papers: 200    # arxiv 全文集合容量上限，超出按 LRU 淘汰最久未用；0=不限
+  max_age_days: 0               # 超 N 天未被检索命中即淘汰；0=不按龄期淘汰
+
+harness:
+  tool_timeout_seconds: 30   # 单次工具调用超时
+  tool_max_retries: 1        # 工具失败/超时的重试次数
+  token_budget: 60000        # 累计 input+output token 上限，超出则停止多跳

@@ -1,0 +1,7 @@
+# Ruff 配置：CI 强制 E9（语法错误）+ F（pyflakes：未定义名 / 未用导入 / f-string 等高确定性问题）。
+# 不开全部风格规则，避免对既有代码产生大量低价值告警。
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]

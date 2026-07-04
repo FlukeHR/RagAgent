@@ -69,27 +69,33 @@ class ArxivTool:
                 f"arxiv_id: {aid}  链接: {result.entry_id}\n"
                 f"摘要: {summary}"
             )
+            downloaded_ok = False
             if download:
                 self.download_dir.mkdir(parents=True, exist_ok=True)
                 target = self.download_dir / f"{aid}.pdf"
                 try:
                     self._download_pdf(result, target)
                     block += f"\n（已下载到 {target}）"
+                    downloaded_ok = True
                 except Exception as exc:  # noqa: BLE001 - 网络/IO 失败不应中断检索
                     block += f"\n（下载失败: {exc}）"
             blocks.append(block)
-            sources.append(
-                {
-                    "id": sid,
-                    "chunk_id": aid,
-                    "paper_id": aid,
-                    "paper_title": result.title,
-                    "section": "Abstract",
-                    "source": result.entry_id,
-                    "score": None,
-                    "snippet": summary[:600],
-                }
-            )
+            src = {
+                "id": sid,
+                "chunk_id": aid,
+                "paper_id": aid,
+                "paper_title": result.title,
+                "section": "Abstract",
+                "source": result.entry_id,
+                "score": None,
+                "snippet": summary[:600],
+            }
+            if downloaded_ok:
+                # 已落地本地 PDF：标记为可预览，并指向下载所在集合（默认 arxiv），
+                # 使前端点击图标能像 demo 的 PDF 一样打开并按摘要定位高亮。
+                src["source"] = f"{aid}.pdf"
+                src["collection"] = self.download_dir.name
+            sources.append(src)
 
         if not blocks:
             return ToolResult(text=f"arXiv 未检索到与 '{query}' 相关的论文。", sources=[])

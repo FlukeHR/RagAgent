@@ -13,8 +13,11 @@ from api.schemas import (
     CollectionsResponse,
     IngestArxivRequest,
     IngestArxivResponse,
+    TitleRequest,
+    TitleResponse,
 )
 from config.settings import BASE_DIR, load_settings
+from llm.model import LLMClient
 from indexing.build_index import build_collection
 from indexing.manager import IndexManager
 from tools import ArxivTool
@@ -39,7 +42,8 @@ def ask(req: AskRequest) -> AskResponse:
 
     try:
         agent = _get_agent(collection)
-        result = agent.ask(req.question)
+        history = [t.model_dump() for t in req.history]
+        result = agent.ask(req.question, history=history)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -50,7 +54,41 @@ def ask(req: AskRequest) -> AskResponse:
         answer=result.answer,
         steps=result.steps,
         sources=result.sources,
+        trace=result.trace,
     )
+
+
+def _truncate_title(text: str, limit: int = 20) -> str:
+    """降级标题：取首条用户消息首行前 limit 字。"""
+    line = re.sub(r"\s+", " ", (text or "").strip())
+    if not line:
+        return "新对话"
+    return line[:limit] + ("…" if len(line) > limit else "")
+
+
+@router.post("/title", response_model=TitleResponse)
+def make_title(req: TitleRequest) -> TitleResponse:
+    """为一段对话自动生成简短标题。无 LLM 后端 / 失败时降级为截取首条用户消息。"""
+    first_user = next((m.content for m in req.messages if m.role == "user"), "")
+    settings = load_settings()
+    llm = LLMClient(settings.llm)
+    if not llm.supports_agentic():  # 无真实后端，直接降级截断
+        return TitleResponse(title=_truncate_title(first_user))
+
+    convo = "\n".join(f"{m.role}: {m.content[:500]}" for m in req.messages[:4])
+    prompt = (
+        "请用不超过 12 个汉字概括下面这轮对话的主题，作为对话列表里的标题。"
+        "只输出标题本身，不要标点、不要引号、不要解释。\n\n"
+        f"对话：\n{convo}\n\n标题："
+    )
+    try:
+        out = llm.generate(prompt, system="你是对话标题生成助手，只输出简短标题。")
+        title = re.sub(r"\s+", " ", (out or "").strip().strip("\"'「」“”。.")).strip()
+        if not title or len(title) > 30 or "降级模式" in title or "调用失败" in title:
+            title = _truncate_title(first_user)
+    except Exception:  # noqa: BLE001 - 生成失败不阻断，降级截断
+        title = _truncate_title(first_user)
+    return TitleResponse(title=title)
 
 
 def _search_phrases(snippet: str, max_phrases: int = 6) -> list[str]:

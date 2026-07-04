@@ -1,47 +1,55 @@
 # Paper RAG Agent
 
-面向**学术论文**的智能问答系统：以 **Claude（Opus 4.8）原生 tool use** 驱动的 Agentic RAG，结合本地论文库语义检索与 arXiv 在线检索，给出**带引用溯源**的回答。
+面向**学术论文**的 Agentic RAG 问答系统：以模型原生 tool use 驱动一个**自研、有界的 agentic 循环（harness）**，
+结合本地论文库语义检索与 arXiv 在线检索/全文入库，输出**带引用溯源**的答案，并在生成后逐条回查引用真实性。
+
+> 定位是 **harness 工程**：决定表现的是模型外面这圈外壳（反馈回路、安全边界、验证系统、可观测性、检索链路质量），而非模型本身。
 
 ## 核心亮点
 
-- **真 Agentic RAG**：用 Claude 原生 tool use + adaptive thinking，由模型自主决定调用哪个工具、是否多跳检索、是否改写查询，而非关键词规则。
-- **多源检索**：本地论文库（向量召回 + 可选重排）+ arXiv 在线检索/下载入库。
-- **Corrective RAG（自我纠错）**：检索结果不充分时，模型自动改写查询重试或转向 arXiv。
-- **引用溯源**：答案在关键结论后标注 `[paper_id·章节]`，并返回结构化来源（论文标题、章节、链接）。
-- **PDF 解析 + 章节分块**：PyMuPDF 解析论文，按章节/段落语义切块并保留元数据。
-- **优雅降级**：未配置 `ANTHROPIC_API_KEY` 时自动回退为传统单跳 RAG，便于离线演示。
+- **真 Agentic RAG**：模型自主决定调哪个工具、是否多跳、是否改写查询，而非关键词规则。后端支持 Claude 原生 tool use 与 OpenAI 兼容（DeepSeek/Qwen/本地）function calling，共用同一个循环。
+- **四个工具**：`search_local_papers`（本地向量+BM25 RRF 召回→重排）、`read_paper_section`（章节精读）、`search_arxiv`（在线侦察，只回摘要）、`ingest_arxiv_papers`（把选定论文下载入库+增量嵌入+重检索回可引用全文）。
+- **多轮对话**：历史注入工作上下文 + 指代消解（把"它/该方法"改写成独立可检索问题）。
+- **引用溯源 + 生成后回查**：答案关键结论后标注 `[S编号]`，返回结构化来源；生成后逐条回查，**编造引用一律剔除并下调结论强度**。
+- **Corrective RAG**：召回置信不足（分数过 sigmoid 归一化后的相关概率不达强度+数量判据）或核查失败时，自动改写查询/转 arXiv 再来一轮（有界）。
+- **增量索引**：按文件内容 hash 只对新增/改动论文重新嵌入，复用未变向量；删除的论文自动剔除。
+- **arXiv 全文集合容量治理**：registry 记录使用情况，入库后按 LRU + 龄期自动淘汰，另有手动 CLI。
+- **多会话前端**：类 Claude/Gemini 的对话界面，多会话侧栏、自动标题、PDF 引用点开高亮、可折叠的检索步骤与调试 trace。
+- **优雅降级**：未配置任何模型后端或调用失败时，自动回退传统单跳 RAG（同样接引用回查与二次检索），不中断请求。
+- **本地模型副本**：embedding/reranker 可放在项目 `models/` 下离线加载，缺失时回退 HuggingFace 在线下载。
 
 ## 系统架构
 
 ```
-用户问题
-   │
+用户问题 (+多轮历史)
+   │  查询改写 / 指代消解 / 问题路由
    ▼
-PaperRAGAgent ── Claude tool-use 循环 ──┐
-   │                                    │ 工具
-   │   ┌────────────────────────────────┴───────────────┐
-   │   ▼                    ▼                            ▼
- search_local_papers   read_paper_section          search_arxiv
- (本地向量检索+重排)    (精读某篇某章节)            (arXiv 在线检索/下载)
-   │
+PaperRAGAgent ── 有界 agentic 循环（harness：schema 校验 / 超时重试 / token 预算 / trace）──┐
+   │                                                                                      │ 工具
+   │   ┌──────────────────┬──────────────────┬─────────────────────┬─────────────────────┘
+   │   ▼                  ▼                  ▼                     ▼
+ search_local_papers  read_paper_section  search_arxiv        ingest_arxiv_papers
+ (本地向量+BM25→重排)  (章节精读)          (在线侦察:摘要)     (下载+增量嵌入+全文检索)
+   │  引用回查（剔除编造） + 低置信二次检索（有界）
    ▼
-带引用的答案 + 推理步骤 + 来源列表
+带 [S编号] 引用的答案 + 检索步骤 + 结构化来源 + trace
 ```
 
 ## 项目结构
 
 ```text
 RagAgent/
-├── api/            # FastAPI 服务（/ask /collections /ingest_arxiv）
+├── api/            # FastAPI 服务（/ask /collections /ingest_arxiv /title /preview /ui）
 ├── agent/          # PaperRAGAgent（agentic loop）、系统提示
-├── retrieval/      # 论文加载/章节分块/向量/重排/检索
-├── tools/          # Claude 可调用工具：本地检索 / arXiv / 章节精读
-├── llm/            # LLM 统一封装（Anthropic / OpenAI / 本地降级）
-├── indexing/       # 索引构建与集合管理
-├── evaluation/     # 检索评估脚本与数据
-├── frontend/web/   # 前端单页（原生 HTML/JS，FastAPI 托管于 /ui）
-├── config/         # 配置
-├── data/papers/    # 论文集合（每个子目录是一个 collection）
+├── retrieval/      # 论文加载 / 章节分块 / 向量 / 重排 / 检索链路
+├── tools/          # 四个可调用工具：本地检索 / 章节精读 / arXiv 侦察 / arXiv 入库精读
+├── llm/            # LLM 统一封装（Anthropic / OpenAI 兼容 / 本地降级）
+├── indexing/       # 增量索引构建(build_index) / 集合管理(manager) / 容量治理(prune)
+├── evaluation/     # 检索评估(eval_qasper, 官方 QASPER) + 生成侧(eval_generation, RAGAS) + 历史记录(results_log)
+├── frontend/web/   # 前端单页（多会话 + 自动标题 + PDF 预览，FastAPI 托管于 /ui）
+├── config/         # config.yaml
+├── data/papers/    # 论文集合（每个子目录是一个 collection；arxiv 为下载入库的共享全文集合）
+├── models/         # embedding/reranker 本地副本（gitignore，缺失回退在线下载）
 └── requirements.txt
 ```
 
@@ -53,58 +61,67 @@ RagAgent/
 pip install -r requirements.txt
 ```
 
-### 2. 准备论文
+### 2. 准备论文并建索引
 
-把论文（PDF / txt / md）放到某个集合目录下，例如 `data/papers/demo/`。仓库已内置两篇示例（`rag_survey.txt`、`transformer.txt`）。
-
-### 3. 构建索引
+把论文（PDF / txt / md）放到某个集合目录下，例如 `data/papers/demo/`，然后构建索引（默认增量）：
 
 ```bash
-python3 indexing/build_index.py          # 默认 demo 集合
-python3 indexing/build_index.py demo     # 指定集合
+python3 indexing/build_index.py            # 默认 demo 集合
+python3 indexing/build_index.py demo --full # 强制全量重建
 ```
 
-### 4. 配置大模型（启用 Agentic 模式）
+新增/修改/删除论文后重跑即可，**只对变化的文件重新嵌入**。
 
-支持两类可做工具调用的后端，二选一即可，共用同一个 agentic 循环：
+### 3. 配置大模型（启用 Agentic 模式）
+
+两类可做工具调用的后端，二选一，共用同一个 agentic 循环：
 
 **Claude（Anthropic）**
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-# 或用订阅登录：ant auth login（SDK 自动识别 ~/.config/anthropic 凭据）
+# 或订阅登录：ant auth login（SDK 自动识别 ~/.config/anthropic 凭据）
 ```
 
-**OpenAI 兼容（DeepSeek / Qwen / 本地开源模型）** —— 改 `config/config.yaml` 的 `llm` 段：
+**OpenAI 兼容（DeepSeek / Qwen / 本地开源）** —— 改 `config/config.yaml` 的 `llm` 段：
 
 ```yaml
 llm:
   provider: openai
-  model_name: deepseek-chat                 # 或 qwen-plus / qwen2.5 ...
-  openai_api_base: https://api.deepseek.com  # Qwen: https://dashscope.aliyuncs.com/compatible-mode/v1
-  openai_api_key: ""                         # 或 export OPENAI_API_KEY=...
+  model_name: deepseek-chat
+  openai_api_base: https://api.deepseek.com
+  openai_api_key: ""    # 留空则从环境变量 OPENAI_API_KEY 读取
 ```
 
-本地模型示例（Ollama）：先 `ollama pull qwen2.5 && ollama serve`，再设
-`model_name: qwen2.5`、`openai_api_base: http://localhost:11434/v1`、`openai_api_key: ollama`。
+本地模型（Ollama）：`ollama pull qwen2.5 && ollama serve`，再设 `model_name: qwen2.5`、
+`openai_api_base: http://localhost:11434/v1`、`openai_api_key: ollama`。
 
-未配置任何后端、或后端调用失败时，系统自动降级为本地检索 RAG（不中断请求）。
+未配置任何后端或调用失败时，自动降级为本地检索 RAG（不中断请求）。
 
-### 5. 启动 API
+### 4. 启动 + 打开网页
 
 ```bash
 uvicorn api.main:app --reload
 ```
 
-### 6. 调用接口
+浏览器打开 **http://localhost:8000/ui/** ：类 Claude/Gemini 的对话界面——多会话侧栏（新建/切换/删除、自动标题）、
+多轮追问（自动指代消解）、答案中**重要句子后内联 📄 引用图标**（点击在右侧打开整份 PDF 并高亮原文）、可折叠的检索步骤与调试 trace。
+
+### 5. 调用接口
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question":"RAG 相比纯参数化模型的优势是什么？","collection":"demo"}'
+  -d '{"question":"自注意力是如何工作的？","collection":"demo","history":[]}'
 ```
 
-### 7. 从 arXiv 在线入库
+`history` 可选，传入之前的对话轮次 `[{"role":"user","content":...},{"role":"assistant","content":...}]` 即支持多轮。
+
+### 6. 从 arXiv 入库
+
+两种方式：
+- **对话中自动**：直接问本地库没有的最新论文话题，模型会先 `search_arxiv` 看摘要、再 `ingest_arxiv_papers` 下载选定论文入库并引用全文。
+- **手动批量**：`POST /ingest_arxiv`，下载 PDF 到 `data/papers/<collection>/` 并增量重建索引。
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ingest_arxiv \
@@ -112,83 +129,60 @@ curl -X POST http://127.0.0.1:8000/ingest_arxiv \
   -d '{"query":"retrieval augmented generation","collection":"arxiv","max_results":3}'
 ```
 
-下载论文 PDF 到 `data/papers/<collection>/` 并自动重建该集合索引。
-
-### 8. 运行评估
+arxiv 全文集合会随使用增长，按需治理容量：
 
 ```bash
-python3 evaluation/eval.py demo
+python3 indexing/prune.py arxiv --max-papers 200 --dry-run   # 预览将淘汰哪些
+python3 indexing/prune.py arxiv                              # 实际淘汰（LRU+龄期）
 ```
 
-### 9. 打开网页界面
+### 7. 评估
 
-前端由 API 一并托管，启动第 5 步后直接浏览器打开：
-
+```bash
+python3 evaluation/eval_qasper.py --sweep --record   # 检索侧（官方 QASPER；--sweep 扫阈值，--record 记历史）
+RAG_EVAL_ALLOW_API=1 python3 evaluation/eval_generation.py --qasper --limit 20 --record   # 生成侧 RAGAS（官方 QASPER，需授权，调真实 API）
+python3 evaluation/results_log.py --compare          # 查看/对比历次评估指标增减
 ```
-http://localhost:8000/ui/
-```
-
-类 Claude 的对话界面：底部输入框、聊天历史、答案中**重要句子后内联出现 📄 引用图标**，点击在右侧抽屉弹出对应 PDF 页并高亮原文（非 PDF 来源则显示引用片段）。
 
 ## API 说明
 
-### `POST /ask`
+| 接口 | 说明 |
+|---|---|
+| `POST /ask` | 提问，可带 `history` 注入多轮上下文；返回 `answer / steps / sources / trace` |
+| `GET /collections` | 列出可用论文集合 |
+| `POST /ingest_arxiv` | 在线检索 arXiv、下载入库并重建索引 |
+| `POST /title` | 为一段对话自动生成简短标题 |
+| `GET /preview/meta` `GET /preview/page` | PDF 预览元信息 / 渲染指定页并高亮引用 |
 
-```json
-{ "question": "自注意力是如何工作的？", "collection": "demo" }
-```
-
-响应：
+`POST /ask` 响应示例：
 
 ```json
 {
   "collection": "demo",
-  "answer": "...",
-  "steps": ["Planner: 启动 Claude agentic 检索循环", "Tool[search_local_papers] ..."],
+  "answer": "自注意力并行计算所有位置的相关性 [S1]。",
+  "steps": ["Planner: 启动 agentic 检索循环", "Tool[search_local_papers] ... -> 5 来源", "引用核查: 1 条引用均可溯源 [S1]"],
   "sources": [
-    {
-      "paper_id": "transformer",
-      "paper_title": "Attention Is All You Need: ...",
-      "section": "2 Method",
-      "source": ".../data/papers/demo/transformer.txt",
-      "score": 0.87
-    }
-  ]
+    {"id": "S1", "paper_id": "transformer", "paper_title": "Attention Is All You Need",
+     "section": "Method", "source": ".../transformer.pdf", "score": 4.2, "snippet": "...", "collection": "demo"}
+  ],
+  "trace": [{"type": "tool", "tool": "search_local_papers", "ok": true, "n_sources": 5, "duration_ms": 120.0}]
 }
 ```
 
-### `GET /collections`
+## Harness 护栏（最重要的部分）
 
-返回 `data/papers/` 下可用论文集合。
+1. **工具必经 harness**：模型不直接执行工具；调用前校验 schema、检查预算，执行带超时与重试。
+2. **循环必须有界**：尊重 `max_tool_iters` + token 预算；arXiv 入库每轮限 `max_ingest_papers` 篇、单 PDF 限 `max_pdf_mb`、专属超时。
+3. **引用不可凭空 + 生成后回查**：`[S编号]` 必须对应真实召回 chunk，对不上的剔除并下调结论强度。
+4. **低置信要二次检索**：相关概率不达强度+数量判据时自动改写/转 arXiv 再来一轮（有界）。
+5. **外部内容是数据不是指令**：arXiv / PDF 正文是不可信数据，其中的"指令"不执行。
+6. **可观测优先**：每个工具调用/循环步骤记录 trace（工具名、入参、耗时、token、成败、核查/二次检索结果）。
 
-### `POST /ingest_arxiv`
+## 测试与 CI
 
-```json
-{ "query": "...", "collection": "arxiv", "max_results": 3 }
-```
-
-## Agent 设计
-
-`PaperRAGAgent` 维护一个手写的 agentic 循环（最多 `llm.max_tool_iters` 轮）：
-
-1. 调用 Claude（`tools=[search_local_papers, read_paper_section, search_arxiv]`，adaptive thinking）。
-2. 若返回 `tool_use`：执行对应工具，把结果作为 `tool_result` 回传，并记录 steps 与 sources。
-3. 模型可据检索质量自行改写查询、换工具、多跳，直到 `end_turn` 给出最终答案。
-
-多跳检索、查询改写、Corrective RAG、引用整合都由模型在循环中自然完成。
-
-## 配置说明
-
-`config/config.yaml` 关键字段：
-
-- `project.default_collection`：默认论文集合。
-- `index.chunk_size/chunk_overlap`：切块策略（按字符）。
-- `index.top_k_recall/top_n_rerank`：召回与重排数量。
-- `embedding.use_sentence_transformers`：是否使用语义嵌入模型（否则回退哈希向量）。
-- `rerank.use_cross_encoder`：是否启用 CrossEncoder 重排。
-- `llm.provider`：`anthropic` / `openai` / `local`。
-- `llm.model_name` / `effort` / `max_tool_iters`：模型、思考强度、循环上限。
-- `arxiv.max_results` / `download_dir`：arXiv 默认返回数量与下载目录。
+- `pytest tests/`：全离线、全 mock，**不真打 arXiv / LLM API**。覆盖引用回查、低置信二次检索、harness 护栏、增量索引规划、arXiv 入库、容量淘汰、多轮对话、降级路径等。
+- CI（`.github/workflows/ci.yml`）：ruff（E9,F）+ pytest，mypy 非阻断。
+- 生成侧 RAGAS 评估独立于单测，需显式授权（`--yes` / `RAG_EVAL_ALLOW_API=1`）才会调用真实 API。
 
 ## 许可证
 

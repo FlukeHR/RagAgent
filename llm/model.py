@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ class LLMTurn:
     tool_calls: list[ToolCall]
     stop: bool
     raw: Any = None  # provider 原生 assistant 表示，用于回填历史
+    usage: dict = field(default_factory=dict)  # {input_tokens, output_tokens}，供预算核算
 
 
 @dataclass
@@ -84,8 +85,22 @@ class LLMClient:
         return self.provider == "openai" and self._openai_configured()
 
     # ---------- 统一 agentic 原语 ----------
-    def init_history(self, question: str) -> list[dict[str, Any]]:
-        return [{"role": "user", "content": question}]
+    def init_history(
+        self, question: str, prior: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        """构造工作历史：把之前的对话轮次（纯文本）注入到当前问题前面。
+
+        prior 中每项为 {"role": "user"|"assistant", "content": str}；两类 provider
+        都接受字符串 content，故可直接复用。非法 role / 空内容会被跳过。
+        """
+        msgs: list[dict[str, Any]] = []
+        for t in prior or []:
+            role = t.get("role")
+            content = (t.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                msgs.append({"role": role, "content": content})
+        msgs.append({"role": "user", "content": question})
+        return msgs
 
     def create_turn(
         self, system: str, history: list[dict], tools: list[dict]
@@ -158,11 +173,16 @@ class LLMClient:
             for b in resp.content
             if b.type == "tool_use"
         ]
+        usage = getattr(resp, "usage", None)
         return LLMTurn(
             text=text,
             tool_calls=tool_calls,
             stop=resp.stop_reason != "tool_use",
             raw=resp.content,
+            usage={
+                "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
+                "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
+            },
         )
 
     # ---------- OpenAI 兼容实现 ----------
@@ -226,11 +246,16 @@ class LLMClient:
                 }
                 for tc in raw_tool_calls
             ]
+        usage = getattr(resp, "usage", None)
         return LLMTurn(
             text=msg.content or "",
             tool_calls=tool_calls,
             stop=not raw_tool_calls,
             raw=raw,
+            usage={
+                "input_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                "output_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+            },
         )
 
     # ---------- 降级：纯文本生成 ----------

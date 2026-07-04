@@ -50,7 +50,6 @@ class PaperChunker:
         if len(text) <= self.chunk_size:
             return [text]
 
-        step = self.chunk_size - self.chunk_overlap
         pieces: list[str] = []
         start = 0
         n = len(text)

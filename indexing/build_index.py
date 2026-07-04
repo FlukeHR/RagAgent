@@ -1,55 +1,166 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import BASE_DIR, Settings, load_settings
-from retrieval.chunker import PaperChunker
+from retrieval.chunker import Chunk, PaperChunker
 from retrieval.embedder import Embedder
 from retrieval.loader import PaperLoader
 from retrieval.vector_store import VectorStore
 
 
-def build_collection(settings: Settings, collection: str) -> int:
-    """为指定论文集合构建索引，返回 chunk 数量。"""
+def _file_hash(path: Path) -> str:
+    """源文件内容 hash（sha1，读字节即可，无需解析 PDF）。"""
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _params_signature(settings: Settings) -> dict:
+    """切块 / 嵌入相关参数签名：任一变化都使旧向量不可复用，触发全量重建。"""
+    return {
+        "chunk_size": settings.index.chunk_size,
+        "chunk_overlap": settings.index.chunk_overlap,
+        "embedding_model": settings.embedding.model_name,
+        "use_sentence_transformers": settings.embedding.use_sentence_transformers,
+    }
+
+
+def plan_incremental(
+    prev_chunks: list[Chunk] | None,
+    prev_vectors: np.ndarray | None,
+    prev_files: dict[str, str],
+    prev_params: dict,
+    cur_files: dict[str, str],
+    params: dict,
+) -> tuple[list[Chunk], np.ndarray | None, list[str], list[str]]:
+    """增量索引规划（纯函数，便于测试）。
+
+    返回 (复用的 chunks, 复用的向量, 需重新嵌入的源文件, 已删除的源文件)。
+    - 参数签名变化或无历史 → 全量重建（复用为空，所有文件待嵌入）。
+    - 文件 hash 未变且历史里有其 chunk → 复用其 chunks + 向量。
+    - 新增 / 改动文件 → 待重新嵌入；历史里有、当前没有的文件 → 删除。
+    """
+    if not prev_chunks or prev_params != params:
+        return [], None, list(cur_files), []
+
+    by_source: dict[str, list[int]] = {}
+    for i, ch in enumerate(prev_chunks):
+        by_source.setdefault(ch.source, []).append(i)
+
+    kept_chunks: list[Chunk] = []
+    kept_idx: list[int] = []
+    for src, h in cur_files.items():
+        if prev_files.get(src) == h and src in by_source:
+            for i in by_source[src]:
+                kept_chunks.append(prev_chunks[i])
+                kept_idx.append(i)
+
+    reused_sources = {c.source for c in kept_chunks}
+    build_sources = [s for s in cur_files if s not in reused_sources]
+    removed = [s for s in prev_files if s not in cur_files]
+    kept_vectors = (
+        prev_vectors[kept_idx] if (kept_idx and prev_vectors is not None) else None
+    )
+    return kept_chunks, kept_vectors, build_sources, removed
+
+
+def build_collection(
+    settings: Settings, collection: str, incremental: bool = True, verbose: bool = False
+) -> int:
+    """为指定论文集合构建索引（默认增量），返回 chunk 数量。
+
+    增量：只对新增/改动的文件重新嵌入，复用未变文件的向量；切块/嵌入参数变化时自动全量重建。
+    """
     data_dir = BASE_DIR / settings.project.data_root / collection
     index_dir = BASE_DIR / settings.index.index_root / collection
 
     loader = PaperLoader(str(data_dir))
-    docs = loader.load()
-
-    chunker = PaperChunker(settings.index.chunk_size, settings.index.chunk_overlap)
-    chunks = chunker.split(docs)
-    if not chunks:
-        raise ValueError(f"集合 '{collection}' 下未找到可索引的论文：{data_dir}")
-
-    embedder = Embedder(
-        settings.embedding.model_name, settings.embedding.use_sentence_transformers
-    )
-    vectors = embedder.encode([c.content for c in chunks])
+    files = list(loader.iter_files())
+    cur_files = {str(f): _file_hash(f) for f in files}
+    params = _params_signature(settings)
 
     store = VectorStore(str(index_dir))
-    store.build(chunks, vectors)
-    return len(chunks)
+    prev_chunks: list[Chunk] | None = None
+    prev_vectors: np.ndarray | None = None
+    prev_manifest: dict = {}
+    if incremental:
+        try:
+            store.load()
+            prev_chunks, prev_vectors = store.chunks, store.vectors
+            prev_manifest = store.read_manifest()
+        except FileNotFoundError:
+            prev_chunks = None  # 首次构建，无历史
+
+    kept_chunks, kept_vectors, build_sources, removed = plan_incremental(
+        prev_chunks,
+        prev_vectors,
+        prev_manifest.get("files", {}),
+        prev_manifest.get("params", {}),
+        cur_files,
+        params,
+    )
+
+    # 仅对需要的文件解析 + 切块 + 嵌入
+    chunker = PaperChunker(settings.index.chunk_size, settings.index.chunk_overlap)
+    by_path = {str(f): f for f in files}
+    new_chunks: list[Chunk] = []
+    for src in build_sources:
+        doc = loader.load_file(by_path[src])
+        if doc is not None:
+            new_chunks.extend(chunker.split([doc]))
+
+    all_chunks = kept_chunks + new_chunks
+    if not all_chunks:
+        raise ValueError(f"集合 '{collection}' 下未找到可索引的论文：{data_dir}")
+
+    if new_chunks:
+        embedder = Embedder(
+            settings.embedding.model_name, settings.embedding.use_sentence_transformers
+        )
+        new_vectors = embedder.encode([c.content for c in new_chunks])
+    else:
+        new_vectors = None
+
+    parts = [v for v in (kept_vectors, new_vectors) if v is not None and len(v)]
+    all_vectors = np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32)
+
+    store.build(all_chunks, all_vectors, files=cur_files, params=params)
+
+    if verbose:
+        n_changed = len([s for s in build_sources if s in prev_manifest.get("files", {})])
+        n_new = len(build_sources) - n_changed
+        print(
+            f"[Index] 复用 {len(kept_chunks)} chunks / "
+            f"新增 {n_new} 文件、改动 {n_changed} 文件、删除 {len(removed)} 文件 "
+            f"→ 重新嵌入 {len(new_chunks)} chunks"
+        )
+    return len(all_chunks)
 
 
 def main() -> None:
     settings = load_settings()
-    collection = (
-        sys.argv[1] if len(sys.argv) > 1 else settings.project.default_collection
-    )
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    full = "--full" in sys.argv[1:]
+    collection = args[0] if args else settings.project.default_collection
 
     data_dir = BASE_DIR / settings.project.data_root / collection
     index_dir = BASE_DIR / settings.index.index_root / collection
-    print(f"[Index] collection = {collection}")
+    print(f"[Index] collection = {collection}（{'全量' if full else '增量'}）")
     print(f"[Index] loading papers from: {data_dir}")
 
-    n = build_collection(settings, collection)
-    print(f"[Index] produced {n} chunks")
+    n = build_collection(settings, collection, incremental=not full, verbose=True)
+    print(f"[Index] 索引共 {n} chunks")
     print(f"[Index] saved index to: {index_dir}")
 
 

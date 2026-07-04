@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
 
 # Virtual envs
 .venv/
@@ -13,5 +14,12 @@ venv/
 # Runtime index artifacts
 /data/indexes/**
 
+# 评估数据集（QASPER 等，体积大，本地下载不入库）
+/evaluation/data/**
+!/evaluation/data/qasper/README.md
+
 # Local logs
 *.log
+
+# 本地模型副本（体积大、可复现：缺失时代码自动回退 HF 在线下载）
+/models/**

@@ -36,6 +36,14 @@ class RerankConfig:
 
 
 @dataclass
+class RetrievalConfig:
+    low_confidence_threshold: float       # 强阈值：最高分经 sigmoid 归一化后的相关概率需 ≥ 此值
+    max_corrections: int
+    weak_confidence_threshold: float = 0.35  # 弱阈值：相关概率 ≥ 此值才算一条"够格"证据
+    min_confident_sources: int = 1           # 数量判据：够格证据至少这么多条，否则判低置信
+
+
+@dataclass
 class LLMConfig:
     provider: str
     model_name: str
@@ -50,6 +58,19 @@ class LLMConfig:
 class ArxivConfig:
     max_results: int
     download_dir: str
+    full_text_collection: str = "arxiv"   # 下载论文入库的共享全文集合（复用 download_dir）
+    max_ingest_papers: int = 3            # ingest_arxiv_papers 每轮下载上限（有界，护栏 #2）
+    max_pdf_mb: float = 30.0              # 单篇 PDF 体积上限，超出跳过
+    ingest_timeout_seconds: float = 120.0  # 下载+增量嵌入+重检索专属超时（含网络/推理）
+    max_collection_papers: int = 200      # arxiv 全文集合容量上限，超出按 LRU 淘汰；0 = 不限
+    max_age_days: int = 0                 # 超过这么多天未被检索命中即淘汰；0 = 不按龄期淘汰
+
+
+@dataclass
+class HarnessConfig:
+    tool_timeout_seconds: float
+    tool_max_retries: int
+    token_budget: int
 
 
 @dataclass
@@ -58,12 +79,27 @@ class Settings:
     index: IndexConfig
     embedding: EmbeddingConfig
     rerank: RerankConfig
+    retrieval: RetrievalConfig
     llm: LLMConfig
     arxiv: ArxivConfig
+    harness: HarnessConfig
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "config.yaml"
+MODELS_DIR = BASE_DIR / "models"
+
+
+def resolve_model_path(name: str) -> str:
+    """优先返回项目 `models/` 下的本地模型副本路径，否则原样返回（HF 名 / 路径）。
+
+    config 里仍写 HF 全名（如 `sentence-transformers/all-MiniLM-L6-v2`）；若
+    `models/all-MiniLM-L6-v2` 存在则用本地副本（离线、可移植），缺失则回退在线下载。
+    """
+    local = MODELS_DIR / Path(name).name
+    if local.is_dir():
+        return str(local)
+    return name
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -80,6 +116,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         index=IndexConfig(**raw["index"]),
         embedding=EmbeddingConfig(**raw["embedding"]),
         rerank=RerankConfig(**raw["rerank"]),
+        retrieval=RetrievalConfig(**raw["retrieval"]),
         llm=LLMConfig(**raw["llm"]),
         arxiv=ArxivConfig(**raw["arxiv"]),
+        harness=HarnessConfig(**raw["harness"]),
     )

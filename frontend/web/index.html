@@ -20,6 +20,7 @@
   :root {
     --bg: #f7f7f5; --panel: #ffffff; --border: #e5e5e0; --text: #2d2d2a;
     --muted: #8a8a82; --accent: #c96442; --accent-soft: #f4e3dc; --user-bg: #ecebe6;
+    --sidebar: #efeee9;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -39,20 +40,66 @@
     border-radius: 8px; background: var(--panel); color: var(--text); cursor: pointer;
   }
   header button:hover { background: var(--bg); }
+  #toggle-sidebar { padding: 6px 9px; }
 
-  /* 主体：左对话 / 右预览 分屏 */
+  /* 主体：侧栏 / 对话 / 预览 */
   #body { flex: 1; display: flex; min-height: 0; }
+
+  /* 会话侧栏 */
+  #sidebar {
+    width: 248px; flex-shrink: 0; background: var(--sidebar);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    transition: width .2s ease, opacity .2s ease; overflow: hidden;
+  }
+  body.nosidebar #sidebar { width: 0; opacity: 0; }
+  #sidebar .side-head { padding: 12px; }
+  #newchat {
+    width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px;
+    font-size: 14px; padding: 10px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--panel); color: var(--text); cursor: pointer; white-space: nowrap;
+  }
+  #newchat:hover { border-color: var(--accent); color: var(--accent); }
+  #sessions { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+  .session {
+    display: flex; align-items: center; gap: 6px; padding: 9px 10px; margin-bottom: 2px;
+    border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text);
+    white-space: nowrap; overflow: hidden;
+  }
+  .session:hover { background: #e4e3dd; }
+  .session.active { background: #ddd9cf; font-weight: 500; }
+  .session .stitle { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .session .sdel {
+    flex-shrink: 0; border: none; background: none; color: var(--muted);
+    cursor: pointer; font-size: 15px; line-height: 1; opacity: 0; padding: 0 2px;
+  }
+  .session:hover .sdel { opacity: 1; }
+  .session .sdel:hover { color: var(--accent); }
+  .side-empty { padding: 16px 12px; color: var(--muted); font-size: 12px; }
+
   #chatpane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #viewer {
-    width: 0; overflow: hidden; border-left: 1px solid var(--border);
+    width: 0; flex-shrink: 0; overflow: hidden; border-left: 1px solid var(--border);
     background: var(--bg); display: flex; flex-direction: column; transition: width .2s ease;
   }
-  body.split #viewer { width: 52%; }
-  body.split #chatpane { flex: 0 0 48%; }
+  /* 预览宽度由 --viewer-w 控制，可拖动分隔条调节 */
+  body.split #viewer { width: var(--viewer-w, 48%); }
+  /* 拖动中关闭过渡，避免跟手延迟 */
+  body.dragging #viewer { transition: none; }
+  body.dragging { cursor: col-resize; user-select: none; }
+
+  /* 对话/预览之间的拖动分隔条 */
+  #divider {
+    width: 6px; flex-shrink: 0; cursor: col-resize; background: var(--border);
+    display: none; position: relative;
+  }
+  body.split #divider { display: block; }
+  #divider:hover, body.dragging #divider { background: var(--accent); }
 
   #chat { flex: 1; overflow-y: auto; padding: 24px 0; }
   .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px; }
   body.split .wrap { max-width: 100%; }
+
+  .empty-hint { color: var(--muted); text-align: center; margin-top: 18vh; font-size: 15px; }
 
   .msg { margin-bottom: 26px; }
   .msg .role { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
@@ -78,6 +125,12 @@
   .steps { margin-top: 12px; font-size: 13px; color: var(--muted); }
   .steps summary { cursor: pointer; }
   .steps ul { margin: 6px 0 0; padding-left: 18px; }
+  .tracetbl { margin: 6px 0 0; border-collapse: collapse; font-size: 12px; width: 100%; }
+  .tracetbl td { padding: 3px 8px 3px 0; vertical-align: top; border-top: 1px solid var(--border); }
+  .tracetbl td.tk {
+    white-space: nowrap; color: var(--accent); font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   .typing { color: var(--muted); font-size: 14px; }
 
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 0 18px; }
@@ -118,13 +171,20 @@
 </head>
 <body>
   <header>
+    <button id="toggle-sidebar" title="折叠/展开会话栏">☰</button>
     <span class="title">📚 Paper RAG Agent</span>
     <span class="spacer"></span>
     <select id="collection" title="论文集合"></select>
-    <button id="newchat">新对话</button>
   </header>
 
   <div id="body">
+    <aside id="sidebar">
+      <div class="side-head">
+        <button id="newchat">＋ 新对话</button>
+      </div>
+      <div id="sessions"></div>
+    </aside>
+
     <section id="chatpane">
       <div id="chat"><div class="wrap" id="messages"></div></div>
       <footer>
@@ -132,9 +192,11 @@
           <textarea id="input" rows="1" placeholder="问点关于论文的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
           <button id="send" title="发送">↑</button>
         </div>
-        <div class="hint">引用以 <span class="cite">📄</span> 出现在相关句子后，点击在右侧打开整份 PDF 并定位高亮。</div>
+        <div class="hint">引用以 <span class="cite">📄</span> 出现在相关句子后，点击在右侧打开整份 PDF 并定位高亮。支持多轮追问（自动指代消解）。</div>
       </footer>
     </section>
+
+    <div id="divider" title="拖动调节预览宽度"></div>
 
     <section id="viewer">
       <div class="viewer-head">
@@ -149,20 +211,91 @@
 const API = "";
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
-let messages = JSON.parse(localStorage.getItem("rag_history") || "[]");
+const sessionsEl = $("sessions");
 
-// ---------- 初始化 ----------
-async function loadCollections() {
-  try {
-    const r = await fetch(`${API}/collections`);
-    const data = await r.json();
-    const sel = $("collection");
-    sel.innerHTML = "";
-    (data.collections || ["demo"]).forEach(c => {
-      const o = document.createElement("option");
-      o.value = o.textContent = c; sel.appendChild(o);
-    });
-  } catch (e) { /* 后端未启动时静默 */ }
+// ---------- 会话存储（多会话，纯前端 localStorage） ----------
+const SESS_KEY = "rag_sessions";
+const ACTIVE_KEY = "rag_active";
+let sessions = [];
+let activeId = null;
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+function loadStore() {
+  try { sessions = JSON.parse(localStorage.getItem(SESS_KEY) || "[]"); } catch (_) { sessions = []; }
+  // 迁移旧的单数组历史 rag_history -> 一个会话
+  if (!sessions.length) {
+    try {
+      const old = JSON.parse(localStorage.getItem("rag_history") || "[]");
+      if (old.length) {
+        sessions = [{ id: uid(), title: "", collection: "", messages: old, createdAt: Date.now(), updatedAt: Date.now() }];
+        localStorage.removeItem("rag_history");
+      }
+    } catch (_) {}
+  }
+  activeId = localStorage.getItem(ACTIVE_KEY);
+  if (!sessions.find(s => s.id === activeId)) activeId = sessions[0] && sessions[0].id;
+  if (!sessions.length) newSession();
+}
+
+function saveStore() {
+  localStorage.setItem(SESS_KEY, JSON.stringify(sessions));
+  if (activeId) localStorage.setItem(ACTIVE_KEY, activeId);
+}
+
+function activeSession() { return sessions.find(s => s.id === activeId); }
+
+function newSession() {
+  const s = { id: uid(), title: "", collection: $("collection") && $("collection").value || "", messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+  sessions.unshift(s);
+  activeId = s.id;
+  saveStore();
+}
+
+function switchSession(id) {
+  activeId = id;
+  saveStore();
+  const s = activeSession();
+  if (s && s.collection && $("collection").querySelector(`option[value="${CSS.escape(s.collection)}"]`)) {
+    $("collection").value = s.collection;
+  }
+  closeViewer();
+  renderSessions();
+  render();
+}
+
+function deleteSession(id, ev) {
+  ev.stopPropagation();
+  sessions = sessions.filter(s => s.id !== id);
+  if (activeId === id) activeId = sessions[0] && sessions[0].id;
+  if (!sessions.length) newSession();
+  saveStore();
+  renderSessions();
+  render();
+}
+
+// ---------- 渲染会话侧栏 ----------
+function sessionLabel(s) {
+  if (s.title) return s.title;
+  const firstUser = s.messages.find(m => m.role === "user");
+  return firstUser ? firstUser.content.slice(0, 16) : "新对话";
+}
+
+function renderSessions() {
+  sessionsEl.innerHTML = "";
+  if (!sessions.length) {
+    sessionsEl.innerHTML = `<div class="side-empty">还没有对话</div>`;
+    return;
+  }
+  sessions.forEach(s => {
+    const div = document.createElement("div");
+    div.className = "session" + (s.id === activeId ? " active" : "");
+    div.innerHTML = `<span class="stitle"></span><button class="sdel" title="删除">×</button>`;
+    div.querySelector(".stitle").textContent = sessionLabel(s);
+    div.addEventListener("click", () => switchSession(s.id));
+    div.querySelector(".sdel").addEventListener("click", (e) => deleteSession(s.id, e));
+    sessionsEl.appendChild(div);
+  });
 }
 
 // ---------- 引用 + 公式 渲染 ----------
@@ -180,7 +313,9 @@ function matchSource(sources, pid, sec) {
 }
 
 function chip(src, collection, title) {
-  const payload = encodeURIComponent(JSON.stringify({ ...src, collection }));
+  // 来源自带 collection（如 arXiv 下载的指向 arxiv 目录）时优先用它，否则用当前聊天集合
+  const coll = src.collection || collection;
+  const payload = encodeURIComponent(JSON.stringify({ ...src, collection: coll }));
   return `<sup class="cite" data-src="${payload}" title="${title}">📄</sup>`;
 }
 
@@ -228,7 +363,13 @@ function typesetMath() {
 
 // ---------- 渲染对话 ----------
 function render() {
+  const s = activeSession();
+  const messages = s ? s.messages : [];
   messagesEl.innerHTML = "";
+  if (!messages.length) {
+    messagesEl.innerHTML = `<div class="empty-hint">开始一段新的论文问答 👋</div>`;
+    return;
+  }
   messages.forEach(m => {
     const div = document.createElement("div");
     div.className = `msg ${m.role}`;
@@ -243,6 +384,13 @@ function render() {
         d.innerHTML = `<summary>🔎 检索步骤 (${m.steps.length})</summary><ul>${m.steps.map(s => `<li>${escapeHtml(s)}</li>`).join("")}</ul>`;
         div.appendChild(d);
       }
+      if (m.trace && m.trace.length) {
+        const d = document.createElement("details");
+        d.className = "steps trace";
+        d.innerHTML = `<summary>🛠 调试 trace (${m.trace.length})</summary>` +
+          `<table class="tracetbl">${m.trace.map(traceRow).join("")}</table>`;
+        div.appendChild(d);
+      }
     }
     messagesEl.appendChild(div);
   });
@@ -253,19 +401,72 @@ function render() {
 function escapeHtml(s) {
   return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 }
-function save() { localStorage.setItem("rag_history", JSON.stringify(messages)); }
+
+// 把一条结构化 trace 事件渲染成表格行：类型徽标 + 关键字段摘要
+function traceRow(e) {
+  const t = e.type || "?";
+  let detail;
+  if (t === "llm") {
+    detail = `第${e.step}轮 · in ${e.tokens_in}/out ${e.tokens_out} tok（累计 ${e.total_tokens}）· stop=${e.stop}`;
+  } else if (t === "tool") {
+    const arg = JSON.stringify(e.input || {});
+    detail = `${e.tool} ${arg} · ${e.ok ? "✓" : "✗"} ${e.n_sources || 0}源 · ${e.duration_ms || 0}ms` +
+      (e.attempts > 1 ? ` · ${e.attempts}次` : "") + (e.error ? ` · ${escapeHtml(e.error)}` : "");
+  } else if (t === "verify") {
+    detail = `${e.result}` + (e.hallucinated && e.hallucinated.length ? ` · 编造 ${e.hallucinated.join(",")}` : "") +
+      (e.valid && e.valid.length ? ` · 有效 ${e.valid.join(",")}` : "") + (e.mode ? ` · ${e.mode}` : "");
+  } else if (t === "rewrite") {
+    detail = `${escapeHtml(e.original || "")} → ${escapeHtml(e.standalone || "")}`;
+  } else if (t === "context") {
+    detail = `注入历史 ${e.history_turns} 轮`;
+  } else if (t === "budget") {
+    detail = `token 预算用尽 ${e.total_tokens}/${e.budget}`;
+  } else {
+    detail = escapeHtml(JSON.stringify(e));
+  }
+  return `<tr><td class="tk">${escapeHtml(t)}</td><td>${detail}</td></tr>`;
+}
+
+// ---------- 自动标题 ----------
+async function maybeTitle(s) {
+  if (s.title) return;
+  const turns = s.messages
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .slice(0, 2)
+    .map(m => ({ role: m.role, content: m.content }));
+  if (!turns.length) return;
+  try {
+    const r = await fetch(`${API}/title`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: turns }),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      if (data.title) { s.title = data.title; saveStore(); renderSessions(); return; }
+    }
+  } catch (_) {}
+  // 降级：截取首条用户消息
+  const fu = s.messages.find(m => m.role === "user");
+  if (fu) { s.title = fu.content.slice(0, 16); saveStore(); renderSessions(); }
+}
 
 // ---------- 发送 ----------
 async function send() {
   const input = $("input");
   const q = input.value.trim();
   if (!q) return;
+  const s = activeSession();
+  if (!s) return;
   const collection = $("collection").value || "demo";
+  s.collection = collection;
 
-  messages.push({ role: "user", content: q });
+  // 把当前会话已有轮次作为历史（仅文本），用于后端历史注入 + 指代消解
+  const history = s.messages.map(m => ({ role: m.role, content: m.content }));
+
+  s.messages.push({ role: "user", content: q });
+  s.updatedAt = Date.now();
   input.value = ""; input.style.height = "auto";
-  render(); save();
-  setSending(true);
+  saveStore(); render(); renderSessions(); setSending(true);
 
   const thinking = document.createElement("div");
   thinking.className = "msg assistant";
@@ -276,23 +477,25 @@ async function send() {
   try {
     const r = await fetch(`${API}/ask`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: q, collection }),
+      body: JSON.stringify({ question: q, collection, history }),
     });
     if (!r.ok) {
       const t = await r.text();
-      messages.push({ role: "assistant", content: `⚠️ 请求失败 (${r.status})：${t}`, sources: [], steps: [], collection });
+      s.messages.push({ role: "assistant", content: `⚠️ 请求失败 (${r.status})：${t}`, sources: [], steps: [], collection });
     } else {
       const data = await r.json();
-      messages.push({
+      s.messages.push({
         role: "assistant", content: data.answer || "(空回答)",
-        sources: data.sources || [], steps: data.steps || [], collection,
+        sources: data.sources || [], steps: data.steps || [], trace: data.trace || [], collection,
       });
     }
   } catch (e) {
-    messages.push({ role: "assistant", content: `⚠️ 网络错误：${e}`, sources: [], steps: [], collection });
+    s.messages.push({ role: "assistant", content: `⚠️ 网络错误：${e}`, sources: [], steps: [], collection });
   } finally {
+    s.updatedAt = Date.now();
     setSending(false);
-    render(); save();
+    saveStore(); render();
+    maybeTitle(s); // 首轮问答后自动起标题
   }
 }
 function setSending(b) { $("send").disabled = b; }
@@ -345,6 +548,78 @@ async function openPreview(src) {
 
 function closeViewer() { document.body.classList.remove("split"); }
 
+// ---------- 预览宽度拖动调节 ----------
+const VIEWER_W_KEY = "rag_viewer_w";
+const MIN_VIEWER = 320;   // 预览最小宽度
+const MIN_CHAT = 360;     // 给对话区保留的最小宽度
+
+function applyViewerWidth(px) {
+  const sideW = $("sidebar").offsetWidth; // 折叠时为 0
+  const avail = $("body").clientWidth - sideW; // 对话+分隔条+预览可用宽
+  const max = Math.max(MIN_VIEWER, avail - MIN_CHAT);
+  const w = Math.min(Math.max(px, MIN_VIEWER), max);
+  document.body.style.setProperty("--viewer-w", w + "px");
+  return w;
+}
+
+// 恢复上次的宽度（无则用默认 48%）
+const savedW = parseInt(localStorage.getItem(VIEWER_W_KEY) || "", 10);
+if (savedW) document.body.style.setProperty("--viewer-w", savedW + "px");
+
+(function initDivider() {
+  const divider = $("divider");
+  let dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    const x = e.touches ? e.touches[0].clientX : e.clientX;
+    // 预览在右侧：宽度 = body 右边界到鼠标的距离
+    const right = $("body").getBoundingClientRect().right;
+    applyViewerWidth(right - x);
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("dragging");
+    const w = parseInt(getComputedStyle($("viewer")).width, 10);
+    if (w) localStorage.setItem(VIEWER_W_KEY, String(w));
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("touchmove", onMove);
+  };
+  const start = (e) => {
+    dragging = true;
+    document.body.classList.add("dragging");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("touchmove", onMove, { passive: true });
+    e.preventDefault();
+  };
+  divider.addEventListener("mousedown", start);
+  divider.addEventListener("touchstart", start, { passive: false });
+  window.addEventListener("mouseup", stop);
+  window.addEventListener("touchend", stop);
+  // 窗口缩放时夹紧，避免预览超出
+  window.addEventListener("resize", () => {
+    if (!document.body.classList.contains("split")) return;
+    const cur = parseInt(getComputedStyle($("viewer")).width, 10);
+    if (cur) applyViewerWidth(cur);
+  });
+})();
+
+// ---------- 初始化集合 ----------
+async function loadCollections() {
+  try {
+    const r = await fetch(`${API}/collections`);
+    const data = await r.json();
+    const sel = $("collection");
+    sel.innerHTML = "";
+    (data.collections || ["demo"]).forEach(c => {
+      const o = document.createElement("option");
+      o.value = o.textContent = c; sel.appendChild(o);
+    });
+    const s = activeSession();
+    if (s && s.collection && sel.querySelector(`option[value="${CSS.escape(s.collection)}"]`)) sel.value = s.collection;
+  } catch (e) { /* 后端未启动时静默 */ }
+}
+
 // ---------- 事件 ----------
 messagesEl.addEventListener("click", e => {
   const el = e.target.closest(".cite");
@@ -353,7 +628,9 @@ messagesEl.addEventListener("click", e => {
 });
 $("viewer-close").addEventListener("click", closeViewer);
 $("send").addEventListener("click", send);
-$("newchat").addEventListener("click", () => { messages = []; save(); render(); closeViewer(); });
+$("newchat").addEventListener("click", () => { newSession(); closeViewer(); renderSessions(); render(); $("input").focus(); });
+$("toggle-sidebar").addEventListener("click", () => document.body.classList.toggle("nosidebar"));
+$("collection").addEventListener("change", () => { const s = activeSession(); if (s) { s.collection = $("collection").value; saveStore(); } });
 
 const input = $("input");
 input.addEventListener("keydown", e => {
@@ -364,8 +641,11 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
 });
 
-loadCollections();
+// ---------- 启动 ----------
+loadStore();
+renderSessions();
 render();
+loadCollections();
 </script>
 </body>
 </html>

@@ -15,7 +15,9 @@ class Reranker:
             try:
                 from sentence_transformers import CrossEncoder
 
-                self._cross_encoder = CrossEncoder(model_name)
+                from config.settings import resolve_model_path
+
+                self._cross_encoder = CrossEncoder(resolve_model_path(model_name))
             except Exception:
                 self._cross_encoder = None
 

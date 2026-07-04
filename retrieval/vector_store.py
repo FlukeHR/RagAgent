@@ -22,7 +22,13 @@ class VectorStore:
         self._vectors: np.ndarray | None = None
         self._faiss_index = None
 
-    def build(self, chunks: list[Chunk], vectors: np.ndarray) -> None:
+    def build(
+        self,
+        chunks: list[Chunk],
+        vectors: np.ndarray,
+        files: dict[str, str] | None = None,
+        params: dict | None = None,
+    ) -> None:
         if len(chunks) != len(vectors):
             raise ValueError("chunks and vectors length mismatch")
 
@@ -33,7 +39,14 @@ class VectorStore:
         with self.meta_path.open("wb") as f:
             pickle.dump(self._chunks, f)
 
-        manifest = {"num_chunks": len(chunks), "dim": int(vectors.shape[1]) if vectors.size else 0}
+        # files / params 用于增量索引：记录每个源文件的内容 hash 与切块/嵌入签名，
+        # 下次 build 时据此判断哪些文件可复用（见 indexing/build_index.py:plan_incremental）。
+        manifest = {
+            "num_chunks": len(chunks),
+            "dim": int(vectors.shape[1]) if vectors.size else 0,
+            "files": files or {},
+            "params": params or {},
+        }
         self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         try:
@@ -43,8 +56,21 @@ class VectorStore:
             index.add(self._vectors)
             faiss.write_index(index, str(self.faiss_path))
             self._faiss_index = index
-        except Exception:
+        except Exception:  # noqa: BLE001 - faiss 不可用时退化为 numpy 点积检索
             self._faiss_index = None
+
+    @property
+    def vectors(self) -> np.ndarray | None:
+        return self._vectors
+
+    def read_manifest(self) -> dict:
+        """读取 manifest（含 files/params）；不存在时返回空 dict。"""
+        if not self.manifest_path.exists():
+            return {}
+        try:
+            return json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
 
     def load(self) -> None:
         if not self.vectors_path.exists() or not self.meta_path.exists():
@@ -75,7 +101,7 @@ class VectorStore:
 
         if self._faiss_index is not None:
             scores, indices = self._faiss_index.search(query_vector.astype(np.float32), top_k)
-            results: list[tuple[CodeChunk, float]] = []
+            results: list[tuple[Chunk, float]] = []
             for idx, score in zip(indices[0], scores[0]):
                 if idx < 0:
                     continue

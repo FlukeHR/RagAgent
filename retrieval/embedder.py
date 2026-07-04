@@ -19,7 +19,9 @@ class Embedder:
             try:
                 from sentence_transformers import SentenceTransformer
 
-                self._st_model = SentenceTransformer(model_name)
+                from config.settings import resolve_model_path
+
+                self._st_model = SentenceTransformer(resolve_model_path(model_name))
             except Exception:
                 self._st_model = None
 

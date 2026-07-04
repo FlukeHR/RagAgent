@@ -8,3 +8,4 @@ class AgentAnswer:
     answer: str
     steps: list[str] = field(default_factory=list)
     sources: list[dict] = field(default_factory=list)
+    trace: list[dict] = field(default_factory=list)  # 结构化可观测事件，见 graph._trace
