@@ -1,7 +1,8 @@
 """评估历史记录：把每次 eval 的「代码版本 + 配置快照 + 指标」追加成一行，便于回溯改进。
 
 记录落在 evaluation/results/history.jsonl（append-only，每行一次 run）。检索侧 / 生成侧共用
-同一 schema，用 kind 区分。配合 eval_qasper.py / eval_generation.py 的 --record 开关使用。
+同一 schema，用 kind 区分。配合 eval_qasper.py / eval_generation.py / eval_pdf_grounding.py
+的 --record 开关使用。
 
 CLI：
     python3 evaluation/results_log.py                 # 打印全部历史
@@ -59,6 +60,12 @@ def config_snapshot(settings) -> dict[str, Any]:
         "low_confidence_threshold": s.retrieval.low_confidence_threshold,
         "weak_confidence_threshold": s.retrieval.weak_confidence_threshold,
         "min_confident_sources": s.retrieval.min_confident_sources,
+        "answerability_min_sources": s.retrieval.answerability_min_sources,
+        "answerability_min_score": s.retrieval.answerability_min_score,
+        "answerability_require_citation": s.retrieval.answerability_require_citation,
+        "pdf_parse_provider": s.pdf_parse.provider,
+        "pdf_parse_auto_ocr": s.pdf_parse.auto_ocr,
+        "image_search_enabled": s.image_search.enabled,
         "provider": s.llm.provider,
         "model_name": s.llm.model_name,
         "effort": s.llm.effort,
@@ -75,7 +82,7 @@ def record_run(
     note: str = "",
     log_path: Path = DEFAULT_LOG,
 ) -> dict[str, Any]:
-    """追加一条评估记录并返回它。kind: "retrieval" | "generation"。"""
+    """追加一条评估记录并返回它。kind: retrieval / generation / pdf_grounding。"""
     rec: dict[str, Any] = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         **git_info(),
@@ -138,7 +145,7 @@ def _print_history(rows: list[dict], last: int | None) -> None:
 
 
 def _print_compare(log_path: Path) -> None:
-    for kind in ("retrieval", "generation"):
+    for kind in ("retrieval", "generation", "pdf_grounding"):
         rows = load_history(log_path, kind)
         print(f"\n===== {kind} 最新对比 =====")
         if len(rows) < 1:
@@ -155,7 +162,7 @@ def _print_compare(log_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="查看 / 对比评估历史记录")
-    parser.add_argument("--kind", choices=["retrieval", "generation"], default=None)
+    parser.add_argument("--kind", choices=["retrieval", "generation", "pdf_grounding"], default=None)
     parser.add_argument("--last", type=int, default=None, help="只看最近 N 条")
     parser.add_argument("--compare", action="store_true", help="对比每个 kind 的最新两次")
     parser.add_argument("--log", default=str(DEFAULT_LOG))

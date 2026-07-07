@@ -28,8 +28,22 @@ retrieval:
   low_confidence_threshold: 0.5    # 强阈值（相关概率）：sigmoid(CE logit=0)=0.5
   weak_confidence_threshold: 0.35  # 弱阈值（相关概率）
   min_confident_sources: 1         # 概率≥弱阈值的来源至少这么多条
+  answerability_min_sources: 1     # 硬闸：低置信/二次检索后仍少于 N 条有效来源则拒答
+  answerability_min_score: 0.0     # 可比分数最低要求；score=None 的精读/页面工具来源按有效来源处理
+  answerability_require_citation: true
   # 引用核查失败 / 低置信时，自动二次检索的最大次数（有界，避免无限多跳）。
   max_corrections: 1
+
+pdf_parse:
+  # provider: pymupdf | tesseract（tesseract 为可选本地 OCR runtime，缺失时自动降级）
+  provider: pymupdf
+  auto_ocr: false
+  timeout_seconds: 30
+
+image_search:
+  enabled: true
+  max_pages: 80
+  max_side: 256
 
 llm:
   # provider: anthropic | openai | local

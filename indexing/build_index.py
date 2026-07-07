@@ -14,16 +14,42 @@ from config.settings import BASE_DIR, Settings, load_settings
 from retrieval.chunker import Chunk, PaperChunker
 from retrieval.embedder import Embedder
 from retrieval.loader import PaperLoader
+from retrieval.pdf_parse import provider_from_config
 from retrieval.vector_store import VectorStore
 
 
 def _file_hash(path: Path) -> str:
-    """源文件内容 hash（sha1，读字节即可，无需解析 PDF）。"""
+    """源文件内容 hash（sha1）。
+
+    PDF 的 OCR/VLM sidecar 也是索引输入，必须纳入 hash；否则 sidecar 改动后增量
+    构建会错误复用旧向量。
+    """
     h = hashlib.sha1()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
+    for item in _index_input_files(path):
+        with item.open("rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
     return h.hexdigest()
+
+
+def _index_input_files(path: Path) -> list[Path]:
+    files = [path]
+    if path.suffix.lower() == ".pdf":
+        files.extend(
+            p
+            for p in (
+                path.with_suffix(".ocr.json"),
+                path.with_suffix(".vlm.json"),
+                path.with_suffix(".elements.json"),
+                path.with_suffix(".layout.json"),
+                path.with_suffix(".tables.json"),
+                path.with_suffix(".figures.json"),
+                path.with_suffix(".formulas.json"),
+                path.with_suffix(".bboxes.json"),
+            )
+            if p.exists()
+        )
+    return files
 
 
 def _params_signature(settings: Settings) -> dict:
@@ -31,8 +57,11 @@ def _params_signature(settings: Settings) -> dict:
     return {
         "chunk_size": settings.index.chunk_size,
         "chunk_overlap": settings.index.chunk_overlap,
+        "chunk_metadata_version": 5,
         "embedding_model": settings.embedding.model_name,
         "use_sentence_transformers": settings.embedding.use_sentence_transformers,
+        "pdf_parse_provider": settings.pdf_parse.provider,
+        "pdf_parse_auto_ocr": settings.pdf_parse.auto_ocr,
     }
 
 
@@ -85,7 +114,12 @@ def build_collection(
     data_dir = BASE_DIR / settings.project.data_root / collection
     index_dir = BASE_DIR / settings.index.index_root / collection
 
-    loader = PaperLoader(str(data_dir))
+    pdf_provider = provider_from_config(
+        settings.pdf_parse.provider,
+        auto_ocr=settings.pdf_parse.auto_ocr,
+        timeout_seconds=settings.pdf_parse.timeout_seconds,
+    )
+    loader = PaperLoader(str(data_dir), pdf_provider=pdf_provider)
     files = list(loader.iter_files())
     cur_files = {str(f): _file_hash(f) for f in files}
     params = _params_signature(settings)
@@ -111,7 +145,9 @@ def build_collection(
         params,
     )
 
-    # 仅对需要的文件解析 + 切块 + 嵌入
+    # 仅对需要的文件解析 + 切块 + 嵌入。索引是混合的：
+    # 1) 细粒度语义 chunk，用于精确证据；
+    # 2) 页级 page chunk，用于页码定位、跨页近似搜索与后续图像/OCR 工具路由。
     chunker = PaperChunker(settings.index.chunk_size, settings.index.chunk_overlap)
     by_path = {str(f): f for f in files}
     new_chunks: list[Chunk] = []
@@ -119,6 +155,8 @@ def build_collection(
         doc = loader.load_file(by_path[src])
         if doc is not None:
             new_chunks.extend(chunker.split([doc]))
+            new_chunks.extend(chunker.split_pages([doc]))
+            new_chunks.extend(chunker.split_elements([doc]))
 
     all_chunks = kept_chunks + new_chunks
     if not all_chunks:

@@ -13,7 +13,15 @@ from agent.state import AgentAnswer
 from config.settings import Settings
 from llm.model import LLMClient, ToolCall, ToolOutcome
 from llm.prompt_builder import build_generation_prompt
-from tools import ArxivIngestTool, ArxivTool, PaperReaderTool, PaperSearchTool
+from tools import (
+    ArxivIngestTool,
+    ArxivTool,
+    ImageSearchTool,
+    PDFPageTool,
+    PDFRegionTool,
+    PaperReaderTool,
+    PaperSearchTool,
+)
 
 
 def _sigmoid(x: float) -> float:
@@ -38,11 +46,17 @@ class PaperRAGAgent:
         self.arxiv_tool = ArxivTool(settings)
         self.arxiv_ingest_tool = ArxivIngestTool(settings)
         self.reader_tool = PaperReaderTool(settings, collection)
+        self.pdf_page_tool = PDFPageTool(settings, collection)
+        self.pdf_region_tool = PDFRegionTool(settings, collection)
+        self.image_search_tool = ImageSearchTool(settings, collection)
         self._tools = {
             self.search_tool.name: self.search_tool,
             self.arxiv_tool.name: self.arxiv_tool,
             self.arxiv_ingest_tool.name: self.arxiv_ingest_tool,
             self.reader_tool.name: self.reader_tool,
+            self.pdf_page_tool.name: self.pdf_page_tool,
+            self.pdf_region_tool.name: self.pdf_region_tool,
+            self.image_search_tool.name: self.image_search_tool,
         }
 
     def ask(
@@ -98,6 +112,9 @@ class PaperRAGAgent:
             ArxivTool.schema(),
             ArxivIngestTool.schema(),
             PaperReaderTool.schema(),
+            PDFPageTool.schema(),
+            PDFRegionTool.schema(),
+            ImageSearchTool.schema(),
         ]
 
     def _ask_agentic(
@@ -169,6 +186,13 @@ class PaperRAGAgent:
                 )
                 continue
 
+            answerable, reason = self._answerability_status(sources, valid_cited)
+            if not answerable:
+                steps.append(f"Answerability: {reason}，拒绝生成实质答案")
+                trace.append({"type": "answerability", "result": "reject", "reason": reason})
+                answer = self._insufficient_evidence_answer(reason, sources)
+                break
+
             steps.append(f"Generator: 第 {hop + 1} 轮生成最终答案")
             answer = self._finalize(cleaned, valid_cited, hallucinated, sources, steps)
             trace.append(
@@ -238,6 +262,43 @@ class PaperRAGAgent:
         top_ok = max(confs) >= rcfg.low_confidence_threshold
         count_ok = sum(c >= rcfg.weak_confidence_threshold for c in confs) >= rcfg.min_confident_sources
         return not (top_ok and count_ok)
+
+    def _answerability_status(
+        self, sources: list[dict], valid_cited: list[str] | None = None
+    ) -> tuple[bool, str]:
+        """Hard no-answer gate after bounded retrieval/correction.
+
+        Vector search always returns nearest neighbors; this gate decides whether
+        those neighbors are sufficient evidence for a substantive answer.
+        """
+        rcfg = self.settings.retrieval
+        effective = [
+            s
+            for s in sources
+            if s.get("snippet") and self._source_meets_answerability_score(s)
+        ]
+        if len(effective) < rcfg.answerability_min_sources:
+            return False, f"有效来源不足 {rcfg.answerability_min_sources} 条"
+        if valid_cited is not None and rcfg.answerability_require_citation and not valid_cited:
+            return False, "答案没有可回查引用"
+        return True, "证据充分"
+
+    def _source_meets_answerability_score(self, source: dict) -> bool:
+        score = source.get("score")
+        if score is None:
+            return True
+        try:
+            return float(score) >= self.settings.retrieval.answerability_min_score
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _insufficient_evidence_answer(reason: str, sources: list[dict]) -> str:
+        if not sources:
+            return f"未检索到充分依据，无法可靠回答这个问题。（原因：{reason}）"
+        ids = ", ".join(str(s.get("id")) for s in sources[:3] if s.get("id"))
+        suffix = f" 已检索到的候选来源（{ids}）不足以支撑实质结论。" if ids else ""
+        return f"未检索到充分依据，无法可靠回答这个问题。（原因：{reason}）{suffix}"
 
     def _correction_feedback(self, hallucinated: list[str], low_conf: bool) -> str:
         """二次检索反馈：引导模型改写查询或转 arXiv，仅用真实来源重写答案。"""
@@ -353,7 +414,8 @@ class PaperRAGAgent:
     @staticmethod
     def _summary_prompt(question: str, sources: list[dict]) -> str:
         refs = "\n".join(
-            f"[{s.get('id', '?')}]《{s['paper_title']}》｜章节 {s['section']}\n{(s.get('snippet') or '')[:300]}"
+            f"[{s.get('id', '?')}]《{s['paper_title']}》｜章节 {s['section']}"
+            f"{PaperRAGAgent._page_label(s)}｜模态 {s.get('modality') or 'text'}\n{(s.get('snippet') or '')[:300]}"
             for s in sources
         )
         return (
@@ -362,6 +424,16 @@ class PaperRAGAgent:
             "（如 [S1]，可连写 [S1][S3]）；只能引用下面出现过的编号，不要使用其他格式。\n\n"
             f"用户问题:\n{question}\n\n已检索来源:\n{refs or '(无)'}\n"
         )
+
+    @staticmethod
+    def _page_label(source: dict) -> str:
+        start = source.get("page_start")
+        end = source.get("page_end")
+        if start is None or end is None:
+            return ""
+        if start == end:
+            return f"｜页码 {start}"
+        return f"｜页码 {start}-{end}"
 
     # ---------- 降级 RAG ----------
     @staticmethod
@@ -374,6 +446,13 @@ class PaperRAGAgent:
                 "paper_title": r.chunk.paper_title,
                 "section": r.chunk.section,
                 "source": r.chunk.source,
+                "page_start": r.chunk.page_start,
+                "page_end": r.chunk.page_end,
+                "element_type": r.chunk.element_type,
+                "modality": r.chunk.modality,
+                "bbox": r.chunk.bbox,
+                "chunk_context": r.chunk.chunk_context,
+                "heading_path": r.chunk.heading_path,
                 "score": round(float(r.score), 4),
                 "snippet": r.chunk.content[:600],
             }
@@ -426,12 +505,33 @@ class PaperRAGAgent:
                 else:
                     steps.append("Corrective: 低置信，二次检索未带来更优结果")
 
+        answerable, reason = self._answerability_status(sources)
+        if not answerable:
+            steps.append(f"Answerability: {reason}，拒绝生成实质答案")
+            trace.append({"type": "answerability", "result": "reject", "reason": reason})
+            return AgentAnswer(
+                answer=self._insufficient_evidence_answer(reason, sources),
+                steps=steps,
+                sources=sources,
+                trace=trace,
+            )
+
         prompt = build_generation_prompt(question, results)
         answer = self.llm.generate(prompt)
         steps.append("Generator: 生成答案")
 
         # 引用回查 + 定稿：剔除编造引用、按情况下调结论强度（与 agentic 主路径同口径）
         cleaned, valid_cited, hallucinated = self._check_citations(answer, sources)
+        answerable, reason = self._answerability_status(sources, valid_cited)
+        if not answerable:
+            steps.append(f"Answerability: {reason}，拒绝生成实质答案")
+            trace.append({"type": "answerability", "result": "reject", "reason": reason})
+            return AgentAnswer(
+                answer=self._insufficient_evidence_answer(reason, sources),
+                steps=steps,
+                sources=sources,
+                trace=trace,
+            )
         answer = self._finalize(cleaned, valid_cited, hallucinated, sources, steps)
         trace.append(
             {"type": "verify", "result": "final", "valid": valid_cited, "hallucinated": hallucinated}

@@ -171,7 +171,8 @@ class ArxivIngestTool:
             c = r.chunk
             sid = f"S{_id_base + i}"
             blocks.append(
-                f"[{sid}]《{c.paper_title}》｜章节 {c.section}｜论文ID {c.paper_id}\n{c.content}"
+                f"[{sid}]《{c.paper_title}》｜章节 {c.section}｜论文ID {c.paper_id}\n"
+                f"上下文：{c.chunk_context or c.section}\n{c.content}"
             )
             sources.append(
                 {
@@ -181,6 +182,13 @@ class ArxivIngestTool:
                     "paper_title": c.paper_title,
                     "section": c.section,
                     "source": c.source,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "element_type": c.element_type,
+                    "modality": c.modality,
+                    "bbox": c.bbox,
+                    "chunk_context": c.chunk_context,
+                    "heading_path": c.heading_path,
                     "score": round(float(r.score), 4),
                     "snippet": c.content[:600],
                     "collection": self.collection,  # 指向 arxiv 全文集合，供前端 PDF 预览定位高亮

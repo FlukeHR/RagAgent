@@ -17,6 +17,8 @@ venv/
 # 评估数据集（QASPER 等，体积大，本地下载不入库）
 /evaluation/data/**
 !/evaluation/data/qasper/README.md
+!/evaluation/data/pdf_grounding/
+!/evaluation/data/pdf_grounding/*.json
 
 # Local logs
 *.log

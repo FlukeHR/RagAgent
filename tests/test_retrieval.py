@@ -68,3 +68,21 @@ def test_low_confidence_count_gate(make_agent):
     assert agent._is_low_confidence(
         [{"id": "S1", "score": 5.0}, {"id": "S2", "score": 2.0}]
     ) is False
+
+
+def test_answerability_gate_rejects_no_sources(make_agent):
+    agent = make_agent()
+    ok, reason = agent._answerability_status([])
+    assert ok is False
+    assert "有效来源不足" in reason
+    assert "未检索到充分依据" in agent._insufficient_evidence_answer(reason, [])
+
+
+def test_answerability_gate_requires_citation_after_generation(make_agent):
+    agent = make_agent()
+    sources = [{"id": "S1", "score": 1.0, "snippet": "relevant evidence"}]
+    ok, reason = agent._answerability_status(sources, valid_cited=[])
+    assert ok is False
+    assert "引用" in reason
+    ok, _ = agent._answerability_status(sources, valid_cited=["S1"])
+    assert ok is True

@@ -8,8 +8,15 @@ def build_generation_prompt(question: str, contexts: list[RetrievalResult]) -> s
     blocks: list[str] = []
     for i, item in enumerate(contexts, start=1):
         c = item.chunk
+        page_label = ""
+        if c.page_start is not None and c.page_end is not None:
+            page_label = (
+                f" p.{c.page_start}" if c.page_start == c.page_end else f" pp.{c.page_start}-{c.page_end}"
+            )
         blocks.append(
-            f"[S{i}] 《{c.paper_title}》· {c.section} (paper_id={c.paper_id})\n{c.content}"
+            f"[S{i}] 《{c.paper_title}》· {c.section}{page_label} [{c.element_type}] "
+            f"(modality={c.modality}, paper_id={c.paper_id})\n"
+            f"Context: {c.chunk_context or c.section}\n{c.content}"
         )
     context_text = "\n\n".join(blocks) if blocks else "(无可用上下文)"
 

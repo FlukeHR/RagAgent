@@ -1,4 +1,4 @@
-# CLAUDE.md — Paper RAG Agent
+# AGENTS.md — Paper RAG Agent
 
 > 给 Claude Code / AI 协作者的项目说明。本文件只记录**相对稳定**的内容（架构、命令、规范、护栏）。
 > 「当前进展 / 待办 / 已知问题」放在 `STATUS.md`，改动频繁的东西不要写进这里。
@@ -13,14 +13,14 @@
 
 - **语言/框架**：Python 3.11+；FastAPI（API）；原生 HTML/JS 前端（由 API 托管于 `/ui`）。
 - **模型层**：Anthropic SDK（Claude，默认后端）/ OpenAI 兼容（DeepSeek、Qwen、本地）/ 无后端或失败时降级为本地检索 RAG。统一封装在 `llm/`。
-- **检索**：PyMuPDF 解析 PDF；sentence-transformers 嵌入（可选，否则哈希向量降级）；CrossEncoder 重排（可选）。
+- **检索**：PyMuPDF 解析 PDF；按页保留文本与页码范围；sentence-transformers 嵌入（可选，否则哈希向量降级）；CrossEncoder 重排（可选）。
 - **外部**：`arxiv` 在线检索 / 下载。
 
 ## 架构（一句话版）
 
 `PaperRAGAgent`（在 `agent/`）维护一个手写 agentic 循环，最多 `llm.max_tool_iters` 轮：
 模型返回 `tool_use` → harness 执行工具 → 把 `tool_result` 注入回去 → 模型可自行改写查询 / 换工具 / 多跳，直到 `end_turn` 给出最终答案。
-四个工具（在 `tools/`）：`search_local_papers`、`read_paper_section`、`search_arxiv`（侦察：只回摘要）、`ingest_arxiv_papers`（把选定 arXiv 论文下载入库 + 增量嵌入 + 重检索回可引用全文）。
+七个工具（在 `tools/`）：`search_local_papers`、`read_paper_section`、`read_pdf_page`（按需读取/渲染单页 PDF）、`read_pdf_region`（按 bbox 读取/渲染页内局部）、`search_pdf_images`（用图片或 PDF 页/区域召回相似页面图像）、`search_arxiv`（侦察：只回摘要）、`ingest_arxiv_papers`（把选定 arXiv 论文下载入库 + 增量嵌入 + 重检索回可引用全文）。
 
 **核心不变量：模型从不直接执行工具。** 所有工具调用都经过 harness：校验 schema → 检查权限/预算 → 执行（带超时、重试）→ 注入结果。新增工具必须遵守这条。
 
@@ -31,9 +31,9 @@
 一次 `/ask` 的有界 Plan–Execute–Verify 链路：
 
 1. **查询改写 / 指代消解 / 问题路由**：多轮对话时把历史注入工作上下文，并把依赖上下文的问题改写成独立可检索的问题；判断走本地库还是 arXiv（或两者）。
-2. **多路召回**：本地稠密向量（+ 可选 BM25）/ arXiv，召回 `top_k_recall`。
+2. **多路召回**：本地混合索引（细粒度 text chunk + 页级 page chunk）做稠密向量召回（+ 可选 BM25 RRF）/ arXiv，召回 `top_k_recall`。
 3. **重排**：可选 CrossEncoder 精排到 `top_n_rerank`。
-4. **上下文拼装**：按章节/来源拼装，保留 `paper_id·章节·来源` 元数据；每条证据有全局唯一的 `[S编号]`。
+4. **上下文拼装**：按章节/来源拼装，保留 `paper_id·章节·来源·页码范围` 元数据；每条证据有全局唯一的 `[S编号]`。
 5. **引用核查**：生成后逐条回查答案里的 `[S编号]` 是否真对应召回到的来源；对不上的引用判为幻觉，剔除并下调结论强度。
 6. **低置信二次检索**：召回/重排分（经 sigmoid 归一化的相关概率）不达强度+数量判据，或引用核查失败时，自动改写查询或转向 arXiv 再来一轮（有界，不无限多跳）。
 
@@ -43,7 +43,7 @@
 api/         FastAPI 服务（/ask /collections /ingest_arxiv /title /preview /ui）
 agent/       PaperRAGAgent（agentic loop）、系统提示
 retrieval/   论文加载 / 章节分块 / 向量 / 重排 / 检索链路
-tools/       Claude 可调用工具：本地检索 / arXiv 侦察 / arXiv 入库精读 / 章节精读
+tools/       Claude 可调用工具：本地检索 / arXiv 侦察 / arXiv 入库精读 / 章节精读 / PDF 页与区域读取 / 图像相似检索
 llm/         LLM 统一封装（Anthropic / OpenAI / 本地降级）
 indexing/    增量索引构建（build_index）、集合管理（manager）、容量治理（prune）
 evaluation/  检索评估脚本与数据（demo + QASPER，同时是 harness 的回归基线）
@@ -53,6 +53,15 @@ data/papers/ 论文集合（每个子目录 = 一个 collection；arxiv 为下�
 models/      embedding/reranker 本地副本（gitignore，缺失回退 HF 在线下载）
 ```
 
+## PDF 解析与定位约定
+
+- PDF loader 必须按页解析，保留 `PageText.page_number`、`PageText.is_scanned_like`，并把章节与 chunk 绑定 `page_start/page_end`。新增解析逻辑不得再只返回整篇拼接文本而丢失页边界。
+- chunk metadata 至少包含 `paper_id`、`paper_title`、`section`、`source`、`page_start/page_end`、`element_type`；将来接入表格、图表、公式时继续沿用 `element_type` 与 `bbox`，不要另开不可追溯的平行结构。
+- 扫描页或低文本页是待 OCR/VLM 处理的数据，不得静默当作普通空文本成功解析。当前地基已能检测 `is_scanned_like` 并把指定 PDF 页渲染为尺寸受限图片，供后续 OCR/VLM 工具按需调用。
+- OCR/VLM 产物采用 PDF 同目录 sidecar 作为稳定接口：`paper.ocr.json` 写页级 OCR 文本，`paper.vlm.json` 写页级 VLM 摘要。支持 `{"pages": [{"page": 1, "ocr_text": "..."}]}` 或 `{"1": "..."}` 这类形状。索引构建必须把 sidecar 纳入文件 hash，并为这些产物生成 `modality=ocr|vlm` 的可检索 chunk。
+- PDF 能力必须工具化、按需加载：检索返回 chunk 和 metadata，精读/页面图片/区域读取/图像相似检索由工具进一步加载；不得把整篇 PDF 或整页图片无界灌进模型上下文。
+- 页码级索引必须保持文本 chunk 的细粒度：构建索引时同时写入语义 text chunk 与页级 page chunk。若新增图像向量或图搜图，必须与现有 text/page 索引并存，并在 trace/source 中说明命中的页、区域和模态。
+
 ## 常用命令
 
 ```bash
@@ -60,6 +69,7 @@ pip install -r requirements.txt              # 安装依赖
 python3 indexing/build_index.py [collection] # 构建索引（默认 demo）
 uvicorn api.main:app --reload                # 启动 API（前端在 http://localhost:8000/ui/）
 python3 evaluation/eval_qasper.py --sweep --record   # QASPER 检索评估（官方集；--sweep 扫阈值，--record 记历史）
+python3 evaluation/eval_pdf_grounding.py path/to/pdf_grounding.json --record # 页码命中 / 表格数值一致性评估
 python3 evaluation/results_log.py --compare  # 查看/对比评估历史（evaluation/results/history.jsonl）
 python3 indexing/prune.py arxiv --dry-run    # arxiv 全文集合容量治理（LRU+龄期淘汰）
 ```
@@ -68,7 +78,7 @@ python3 indexing/prune.py arxiv --dry-run    # arxiv 全文集合容量治理（
 
 ## 配置
 
-关键字段在 `config/config.yaml`：`project.default_collection`、`index.chunk_size/chunk_overlap`、`index.top_k_recall/top_n_rerank`、`retrieval.low_confidence_threshold/weak_confidence_threshold/min_confident_sources`（低置信为 sigmoid 归一化后的相关概率，强度+数量双判据）、`embedding.use_sentence_transformers`、`rerank.use_cross_encoder`、`llm.provider/model_name/effort/max_tool_iters`、`arxiv.max_results/download_dir/max_ingest_papers/max_pdf_mb/ingest_timeout_seconds/max_collection_papers/max_age_days`。改配置时改这里，不要把值硬编码进代码。
+关键字段在 `config/config.yaml`：`project.default_collection`、`index.chunk_size/chunk_overlap`、`index.top_k_recall/top_n_rerank`、`retrieval.low_confidence_threshold/weak_confidence_threshold/min_confident_sources/answerability_*`（低置信为 sigmoid 归一化后的相关概率，强度+数量双判据；answerability 为拒答硬闸）、`pdf_parse.provider/auto_ocr/timeout_seconds`、`image_search.enabled/max_pages/max_side`、`embedding.use_sentence_transformers`、`rerank.use_cross_encoder`、`llm.provider/model_name/effort/max_tool_iters`、`arxiv.max_results/download_dir/max_ingest_papers/max_pdf_mb/ingest_timeout_seconds/max_collection_papers/max_age_days`。改配置时改这里，不要把值硬编码进代码。
 
 ## 编码规范
 
@@ -99,7 +109,7 @@ python3 indexing/prune.py arxiv --dry-run    # arxiv 全文集合容量治理（
 ## 测试与评估
 
 - 改动检索 / agent 逻辑后，跑 `python3 evaluation/eval_qasper.py --record` 并与基线比对；**指标回退不算完成**（基线数值见 `STATUS.md`）。评测一律用官方集（QASPER 等），不用手造样本。
-- **指标**：检索侧 Hit@k / MRR / nDCG（`eval_qasper.py`，官方 QASPER）；生成侧 RAGAS（`eval_generation.py`，faithfulness / answer relevancy / context precision）。评测一律用官方集，不用手造样本。生成侧**会调真实 API**，需显式授权（`--yes` / `RAG_EVAL_ALLOW_API=1`），与单测隔离。新增坏行为先变成一条 eval 用例，再修。
+- **指标**：检索侧 Hit@k / MRR / nDCG（`eval_qasper.py`，官方 QASPER）；PDF grounding 侧 page hit / page recall / value consistency（`eval_pdf_grounding.py`，用于页码定位与表格/数值一致性）；生成侧 RAGAS（`eval_generation.py`，faithfulness / answer relevancy / context precision）。QASPER 等通用评测优先官方集；PDF grounding 可用项目维护的结构化样本集补足页码/表格能力。生成侧**会调真实 API**，需显式授权（`--yes` / `RAG_EVAL_ALLOW_API=1`），与单测隔离。新增坏行为先变成一条 eval 用例，再修。
 - 新功能要带单测；外部调用一律 mock，**不要在测试里真打** arXiv / 模型 API。
 - 降级路径要有断言：嵌入模型 / Claude 不可用时确实降级到本地检索 RAG（同样接引用回查与二次检索），且不静默吞错。
 - **CI**（`.github/workflows/ci.yml`）：ruff（E9,F）+ pytest 强制，mypy 非阻断。eval 门禁因需模型/数据/API 暂未入 CI。
@@ -113,10 +123,10 @@ python3 indexing/prune.py arxiv --dry-run    # arxiv 全文集合容量治理（
 
 ## 路线方向（扩展时朝这走，*不代表已实现*）
 
-- **多模态解析**：当前只解析 PDF 文本；扩展到图表 / 表格 / 公式——对含图文档结合 **OCR + VLM** 抽取文本与语义，切块时清洗并绑定元数据，让"看图的问题"也能被检索到。
+- **多模态解析**：已落地 PDF 页级文本、页码范围 metadata、混合 text/page 索引、扫描页检测、页面/区域图片渲染、`PDFParseProvider` 抽象、OCR/VLM 与 table/figure/formula/bbox sidecar 入索引、`read_pdf_page` / `read_pdf_region` 按需工具，以及 `search_pdf_images` 离线图像相似检索 fallback；后续可把图像签名替换为 CLIP/SigLIP，把 OCR provider 扩展到 LiteParse/LlamaParse/PaddleOCR/VLM。
 - **真向量库**：自研 numpy/faiss → pgvector / Qdrant（BM25 + 稠密 RRF 混合已落地，见 `retrieval/retriever.py`）。
 - **分层缓存 + 工厂式可插拔**：把解析、切块、向量化、查询改写、rerank 抽象为**可插拔模块**（工厂模式），便于换型对比；分层缓存复用 QA 结构与索引结构，降重复开销。（增量索引按文档 Hash 已落地，见 `indexing/build_index.py`。）
-- **MCP**：四个工具封装成独立 **MCP server** 对外复用；arXiv 等改为消费现成 MCP。
+- **MCP**：现有 harness 工具封装成独立 **MCP server** 对外复用；arXiv 等改为消费现成 MCP。
 - **Skill**：领域工作流沉淀为 `SKILL.md`——文献综述 / 论文对比 / 引用导出。
 - **可观测**：接 OpenTelemetry 或 Langfuse，全链路 trace + 成本。
 - **工程地基**：Docker Compose、密钥管理、API 鉴权限流、arXiv 异步入库、CI/CD。
@@ -126,7 +136,7 @@ python3 indexing/prune.py arxiv --dry-run    # arxiv 全文集合容量治理（
 - **Agentic RAG**：由模型自主决定检索策略（调哪个工具 / 是否多跳 / 是否改写），非关键词规则。
 - **Corrective RAG**：检索不充分时模型自动改写查询或转向 arXiv（本项目落地为 §4 低置信二次检索）。
 - **collection**：`data/papers/` 下的一个论文子目录，独立建索引。
-- **chunk**：按章节 / 段落语义切块，保留元数据。
+- **chunk**：按章节 / 段落语义切块，保留论文、章节、来源、页码范围等元数据。
 - **rerank**：召回后用 CrossEncoder 重排。
 - **citation grounding**：答案结论标注 `[S编号]`、返回结构化来源，并在生成后回查真实性。
 

@@ -13,6 +13,13 @@ class Chunk:
     section: str
     content: str
     source: str
+    page_start: int | None = None
+    page_end: int | None = None
+    element_type: str = "text"
+    modality: str = "text"
+    bbox: tuple[float, float, float, float] | None = None
+    chunk_context: str | None = None
+    heading_path: str | None = None
 
 
 class PaperChunker:
@@ -38,10 +45,156 @@ class PaperChunker:
                             section=section.title,
                             content=piece,
                             source=doc.source,
+                            page_start=section.page_start,
+                            page_end=section.page_end,
+                            modality=section.modality,
+                            chunk_context=self._context(
+                                doc.title,
+                                section.title,
+                                section.page_start,
+                                section.page_end,
+                                "text",
+                                section.modality,
+                            ),
+                            heading_path=section.heading_path or section.title,
                         )
                     )
                     idx += 1
         return chunks
+
+    def split_elements(self, docs: list[PaperDocument]) -> list[Chunk]:
+        """Create chunks from parsed tables, figures, formulas and layout sidecars."""
+        chunks: list[Chunk] = []
+        for doc in docs:
+            for element in doc.elements or []:
+                chunks.append(
+                    Chunk(
+                        chunk_id=f"{doc.paper_id}::{element.element_type}::{element.element_id}",
+                        paper_id=doc.paper_id,
+                        paper_title=doc.title,
+                        section=self._element_section(element.element_type, element.page_start),
+                        content=element.content,
+                        source=doc.source,
+                        page_start=element.page_start,
+                        page_end=element.page_end,
+                        element_type=element.element_type,
+                        modality=element.modality,
+                        bbox=element.bbox,
+                        chunk_context=self._context(
+                            doc.title,
+                            self._element_section(element.element_type, element.page_start),
+                            element.page_start,
+                            element.page_end,
+                            element.element_type,
+                            element.modality,
+                        ),
+                        heading_path=self._element_section(element.element_type, element.page_start),
+                    )
+                )
+        return chunks
+
+    def split_pages(self, docs: list[PaperDocument]) -> list[Chunk]:
+        """Create page-level text chunks for hybrid page + semantic retrieval."""
+        chunks: list[Chunk] = []
+        for doc in docs:
+            for page in doc.pages or []:
+                text = page.text.strip()
+                if text:
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"{doc.paper_id}::page::{page.page_number}",
+                            paper_id=doc.paper_id,
+                            paper_title=doc.title,
+                            section=f"Page {page.page_number}",
+                            content=text,
+                            source=doc.source,
+                            page_start=page.page_number,
+                            page_end=page.page_number,
+                            element_type="page",
+                            modality="text",
+                            bbox=(page.blocks[0].bbox if page.blocks and page.blocks[0].bbox else None),
+                            chunk_context=self._context(
+                                doc.title, f"Page {page.page_number}", page.page_number, page.page_number, "page", "text"
+                            ),
+                            heading_path=f"Page {page.page_number}",
+                        )
+                    )
+                if page.ocr_text and page.ocr_text.strip():
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"{doc.paper_id}::ocr::{page.page_number}",
+                            paper_id=doc.paper_id,
+                            paper_title=doc.title,
+                            section=f"Page {page.page_number} OCR",
+                            content=page.ocr_text.strip(),
+                            source=doc.source,
+                            page_start=page.page_number,
+                            page_end=page.page_number,
+                            element_type="ocr",
+                            modality="ocr",
+                            chunk_context=self._context(
+                                doc.title, f"Page {page.page_number} OCR", page.page_number, page.page_number, "ocr", "ocr"
+                            ),
+                            heading_path=f"Page {page.page_number} OCR",
+                        )
+                    )
+                if page.vlm_summary and page.vlm_summary.strip():
+                    chunks.append(
+                        Chunk(
+                            chunk_id=f"{doc.paper_id}::vlm::{page.page_number}",
+                            paper_id=doc.paper_id,
+                            paper_title=doc.title,
+                            section=f"Page {page.page_number} VLM summary",
+                            content=page.vlm_summary.strip(),
+                            source=doc.source,
+                            page_start=page.page_number,
+                            page_end=page.page_number,
+                            element_type="vlm",
+                            modality="vlm",
+                            chunk_context=self._context(
+                                doc.title,
+                                f"Page {page.page_number} VLM summary",
+                                page.page_number,
+                                page.page_number,
+                                "vlm",
+                                "vlm",
+                            ),
+                            heading_path=f"Page {page.page_number} VLM summary",
+                        )
+                    )
+        return chunks
+
+    @staticmethod
+    def _context(
+        paper_title: str,
+        section: str,
+        page_start: int | None,
+        page_end: int | None,
+        element_type: str,
+        modality: str,
+    ) -> str:
+        page = ""
+        if page_start is not None and page_end is not None:
+            page = f"第 {page_start} 页" if page_start == page_end else f"第 {page_start}-{page_end} 页"
+        elif page_start is not None:
+            page = f"第 {page_start} 页"
+        bits = [f"《{paper_title}》", section]
+        if page:
+            bits.append(page)
+        bits.append(f"{element_type}/{modality}")
+        return "，".join(bits)
+
+    @staticmethod
+    def _element_section(element_type: str, page: int) -> str:
+        label = {
+            "table": "Table",
+            "figure": "Figure",
+            "formula": "Formula",
+            "text_block": "Text block",
+            "image": "Image",
+            "page_image": "Page image",
+        }.get(element_type, element_type.title())
+        return f"{label} on page {page}"
 
     def _split_text(self, text: str) -> list[str]:
         text = text.strip()

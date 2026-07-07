@@ -41,6 +41,23 @@ class RetrievalConfig:
     max_corrections: int
     weak_confidence_threshold: float = 0.35  # 弱阈值：相关概率 ≥ 此值才算一条"够格"证据
     min_confident_sources: int = 1           # 数量判据：够格证据至少这么多条，否则判低置信
+    answerability_min_sources: int = 1       # 硬闸：至少需要这么多有效来源才能生成实质答案
+    answerability_min_score: float = 0.0     # 硬闸：可比分数需达到该 logit/融合分；None 来源按有效工具来源处理
+    answerability_require_citation: bool = True
+
+
+@dataclass
+class PDFParseConfig:
+    provider: str = "pymupdf"
+    auto_ocr: bool = False
+    timeout_seconds: float = 30.0
+
+
+@dataclass
+class ImageSearchConfig:
+    enabled: bool = True
+    max_pages: int = 80
+    max_side: int = 256
 
 
 @dataclass
@@ -80,6 +97,8 @@ class Settings:
     embedding: EmbeddingConfig
     rerank: RerankConfig
     retrieval: RetrievalConfig
+    pdf_parse: PDFParseConfig
+    image_search: ImageSearchConfig
     llm: LLMConfig
     arxiv: ArxivConfig
     harness: HarnessConfig
@@ -117,6 +136,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         embedding=EmbeddingConfig(**raw["embedding"]),
         rerank=RerankConfig(**raw["rerank"]),
         retrieval=RetrievalConfig(**raw["retrieval"]),
+        pdf_parse=PDFParseConfig(**raw.get("pdf_parse", {})),
+        image_search=ImageSearchConfig(**raw.get("image_search", {})),
         llm=LLMConfig(**raw["llm"]),
         arxiv=ArxivConfig(**raw["arxiv"]),
         harness=HarnessConfig(**raw["harness"]),

@@ -97,6 +97,25 @@ class PaperReaderTool:
             "paper_title": doc.title,
             "section": section,
             "source": doc.source,
+            "page_start": (
+                next((s.page_start for s in doc.sections if s.title == section), None)
+                if section != "TOC"
+                else None
+            ),
+            "page_end": (
+                next((s.page_end for s in doc.sections if s.title == section), None)
+                if section != "TOC"
+                else None
+            ),
+            "element_type": "text",
+            "modality": "text",
+            "bbox": None,
+            "chunk_context": (
+                f"《{doc.title}》，{section}"
+                if section != "TOC"
+                else f"《{doc.title}》，章节目录"
+            ),
+            "heading_path": section,
             "score": None,
             "snippet": snippet,
         }

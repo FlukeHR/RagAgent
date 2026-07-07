@@ -44,8 +44,14 @@ class PaperSearchTool:
         for i, r in enumerate(results, start=1):
             c = r.chunk
             sid = f"S{_id_base + i}"  # 全局唯一引用编号，模型据此引用
+            page_label = (
+                f"｜页码 {c.page_start}" if c.page_start == c.page_end and c.page_start is not None
+                else f"｜页码 {c.page_start}-{c.page_end}" if c.page_start is not None and c.page_end is not None
+                else ""
+            )
             blocks.append(
-                f"[{sid}]《{c.paper_title}》｜章节 {c.section}｜论文ID {c.paper_id}"
+                f"[{sid}]《{c.paper_title}》｜章节 {c.section}{page_label}｜类型 {c.element_type}｜模态 {c.modality}｜论文ID {c.paper_id}"
+                f"\n上下文：{c.chunk_context or c.section}"
                 f"（论文ID 仅供 read_paper_section 调用，引用时请用 {sid}）\n{c.content}"
             )
             sources.append(
@@ -56,6 +62,13 @@ class PaperSearchTool:
                     "paper_title": c.paper_title,
                     "section": c.section,
                     "source": c.source,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "element_type": c.element_type,
+                    "modality": c.modality,
+                    "bbox": c.bbox,
+                    "chunk_context": c.chunk_context,
+                    "heading_path": c.heading_path,
                     "score": round(float(r.score), 4),
                     "snippet": c.content[:600],  # 供 /preview 在 PDF 中精确定位高亮
                 }

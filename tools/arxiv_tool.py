@@ -87,6 +87,11 @@ class ArxivTool:
                 "paper_title": result.title,
                 "section": "Abstract",
                 "source": result.entry_id,
+                "element_type": "abstract",
+                "modality": "text",
+                "bbox": None,
+                "chunk_context": f"arXiv abstract for {result.title}",
+                "heading_path": "Abstract",
                 "score": None,
                 "snippet": summary[:600],
             }

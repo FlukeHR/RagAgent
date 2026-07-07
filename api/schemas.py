@@ -25,9 +25,20 @@ class SourceItem(BaseModel):
     paper_title: str
     section: str
     source: str
+    page_start: int | None = None
+    page_end: int | None = None
+    element_type: str | None = None
+    modality: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    chunk_context: str | None = None
+    heading_path: str | None = None
     score: float | None = None
     snippet: str | None = None  # 引用原文片段，前端预览时用于在 PDF 中定位高亮
     collection: str | None = None  # 该来源 PDF 所在集合目录（arXiv 下载的指向 arxiv），供前端预览定位
+    image_mime_type: str | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    image_base64: str | None = None
 
 
 class AskResponse(BaseModel):

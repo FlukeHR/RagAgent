@@ -147,6 +147,7 @@ def preview_meta(
     collection: str = Query(...),
     paper_id: str = Query(...),
     snippet: str | None = Query(None),
+    page_start: int | None = Query(None),
 ) -> dict:
     """返回 PDF 总页数与引用所在页（1 基），供前端加载整份文档并滚动定位。"""
     import fitz
@@ -154,10 +155,24 @@ def preview_meta(
     pdf_path = _pdf_path_or_404(collection, paper_id)
     with fitz.open(str(pdf_path)) as doc:
         match_page = 1
-        if snippet:
+        if page_start:
+            match_page = min(max(page_start, 1), len(doc))
+        elif snippet:
             _, pno = _locate(doc, snippet)
             match_page = pno + 1
         return {"pages": len(doc), "match_page": match_page}
+
+
+def _parse_bbox_param(bbox: str | None):
+    if not bbox:
+        return None
+    try:
+        parts = [float(x.strip()) for x in bbox.split(",")]
+    except ValueError:
+        return None
+    if len(parts) != 4:
+        return None
+    return parts
 
 
 @router.get("/preview/page")
@@ -166,6 +181,7 @@ def preview_page(
     paper_id: str = Query(...),
     page: int = Query(1, ge=1),
     snippet: str | None = Query(None),
+    bbox: str | None = Query(None),
     zoom: float = Query(1.6, ge=0.5, le=4.0),
 ) -> Response:
     """渲染 PDF 指定页为 PNG；若该页含引用片段则就地高亮。"""
@@ -175,6 +191,11 @@ def preview_page(
     with fitz.open(str(pdf_path)) as doc:
         pno = min(page - 1, len(doc) - 1)
         pg = doc[pno]
+        bbox_parts = _parse_bbox_param(bbox)
+        if bbox_parts:
+            rect = fitz.Rect(*bbox_parts) & pg.rect
+            if not rect.is_empty:
+                pg.draw_rect(rect, color=(1, 0.72, 0), width=2)
         if snippet:
             rects: list = []
             for ph in _search_phrases(snippet):
