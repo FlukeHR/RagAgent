@@ -149,6 +149,9 @@ def prune_library(
     else:
         for name in _INDEX_FILES:
             (index_dir / name).unlink(missing_ok=True)
+        for pattern in ("vectors-*.npy", "metadata-*.pkl", "faiss-*.index"):
+            for path in index_dir.glob(pattern):
+                path.unlink(missing_ok=True)
     return evict
 
 

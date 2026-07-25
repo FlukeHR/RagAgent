@@ -14,6 +14,7 @@ from config.settings import BASE_DIR, Settings, load_settings
 from retrieval.chunker import Chunk, PaperChunker
 from retrieval.embedder import Embedder
 from retrieval.loader import PaperLoader
+from retrieval.image_index import PageImageIndex
 from retrieval.pdf_parse import provider_from_config
 from retrieval.vector_store import VectorStore
 
@@ -52,14 +53,13 @@ def _index_input_files(path: Path) -> list[Path]:
     return files
 
 
-def _params_signature(settings: Settings) -> dict:
+def _params_signature(settings: Settings, embedding_signature: dict) -> dict:
     """切块 / 嵌入相关参数签名：任一变化都使旧向量不可复用，触发全量重建。"""
     return {
         "chunk_size": settings.index.chunk_size,
         "chunk_overlap": settings.index.chunk_overlap,
-        "chunk_metadata_version": 5,
-        "embedding_model": settings.embedding.model_name,
-        "use_sentence_transformers": settings.embedding.use_sentence_transformers,
+        "chunk_metadata_version": 6,
+        "embedding": embedding_signature,
         "pdf_parse_provider": settings.pdf_parse.provider,
         "pdf_parse_auto_ocr": settings.pdf_parse.auto_ocr,
     }
@@ -122,7 +122,12 @@ def build_index(
     loader = PaperLoader(str(data_dir), pdf_provider=pdf_provider)
     files = list(loader.iter_files())
     cur_files = {str(f): _file_hash(f) for f in files}
-    params = _params_signature(settings)
+    embedder = Embedder(
+        settings.embedding.model_name,
+        settings.embedding.use_sentence_transformers,
+        settings.embedding.fallback_dimension,
+    )
+    params = _params_signature(settings, embedder.signature)
 
     store = VectorStore(str(index_dir))
     prev_chunks: list[Chunk] | None = None
@@ -154,18 +159,13 @@ def build_index(
     for src in build_sources:
         doc = loader.load_file(by_path[src])
         if doc is not None:
-            new_chunks.extend(chunker.split([doc]))
-            new_chunks.extend(chunker.split_pages([doc]))
-            new_chunks.extend(chunker.split_elements([doc]))
+            new_chunks.extend(chunker.build([doc]))
 
     all_chunks = kept_chunks + new_chunks
     if not all_chunks:
         raise ValueError(f"未找到可索引的论文：{data_dir}")
 
     if new_chunks:
-        embedder = Embedder(
-            settings.embedding.model_name, settings.embedding.use_sentence_transformers
-        )
         new_vectors = embedder.encode([c.content for c in new_chunks])
     else:
         new_vectors = None
@@ -173,7 +173,21 @@ def build_index(
     parts = [v for v in (kept_vectors, new_vectors) if v is not None and len(v)]
     all_vectors = np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32)
 
-    store.build(all_chunks, all_vectors, files=cur_files, params=params)
+    # OCR runtime may have generated a sidecar while parsing; persist its final hash.
+    cur_files = {str(f): _file_hash(f) for f in files}
+    store.build(
+        all_chunks,
+        all_vectors,
+        files=cur_files,
+        params=params,
+        embedding_signature=embedder.signature,
+    )
+    if settings.image_search.enabled:
+        PageImageIndex(index_dir).build(
+            [path for path in files if path.suffix.lower() == ".pdf"],
+            max_pages=settings.image_search.max_pages,
+            max_side=settings.image_search.max_side,
+        )
 
     if verbose:
         n_changed = len([s for s in build_sources if s in prev_manifest.get("files", {})])

@@ -3,15 +3,16 @@ from __future__ import annotations
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
-
-import jsonschema
-
+from agent.conversation import ConversationManager, ConversationState
 from agent.prompts import SYSTEM_PROMPT
+from agent.evidence import EvidenceRegistry
+from agent.fallback import FallbackRAG
+from agent.harness import ToolHarness
+from agent.memory import ConversationMemory
+from agent.verifier import AnswerVerifier
 from agent.state import AgentAnswer
 from config.settings import Settings
-from llm.model import LLMClient, ToolCall, ToolOutcome
+from llm.model import LLMClient
 from llm.prompt_builder import build_generation_prompt
 from tools import (
     ArxivIngestTool,
@@ -21,6 +22,7 @@ from tools import (
     PDFRegionTool,
     PaperReaderTool,
     PaperSearchTool,
+    ToolRegistry,
 )
 
 
@@ -41,39 +43,166 @@ class PaperRAGAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.llm = LLMClient(settings.llm)
+        self.conversation = ConversationManager(settings)
+        self.memory = ConversationMemory(settings)
         self.search_tool = PaperSearchTool(settings)
+        self.fallback = FallbackRAG(settings, self.search_tool.retriever)
         self.arxiv_tool = ArxivTool(settings)
         self.arxiv_ingest_tool = ArxivIngestTool(settings)
         self.reader_tool = PaperReaderTool(settings)
         self.pdf_page_tool = PDFPageTool(settings)
         self.pdf_region_tool = PDFRegionTool(settings)
         self.image_search_tool = ImageSearchTool(settings)
-        self._tools = {
-            self.search_tool.name: self.search_tool,
-            self.arxiv_tool.name: self.arxiv_tool,
-            self.arxiv_ingest_tool.name: self.arxiv_ingest_tool,
-            self.reader_tool.name: self.reader_tool,
-            self.pdf_page_tool.name: self.pdf_page_tool,
-            self.pdf_region_tool.name: self.pdf_region_tool,
-            self.image_search_tool.name: self.image_search_tool,
-        }
+        self.tool_registry = ToolRegistry(
+            [
+                self.search_tool,
+                self.arxiv_tool,
+                self.arxiv_ingest_tool,
+                self.reader_tool,
+                self.pdf_page_tool,
+                self.pdf_region_tool,
+                self.image_search_tool,
+            ]
+        )
 
-    def ask(self, question: str, history: list[dict] | None = None) -> AgentAnswer:
+    def ask(
+        self,
+        question: str,
+        history: list[dict] | None = None,
+        session_id: str | None = None,
+    ) -> AgentAnswer:
         """回答一个问题。history 为本会话之前的对话轮次（{role, content} 纯文本）。
 
         有历史时先做查询改写 / 指代消解，得到独立可检索的问题；两条路径都用它检索，
         agentic 路径还会把历史注入工作上下文，使多轮对话连贯。
         """
-        history = history or []
-        standalone = self._rewrite_query(question, history)
+        started = time.perf_counter()
+        self.llm.consume_usage_events()
+        state = ConversationState()
+        stored_history: list[dict] = []
+        if session_id:
+            state, stored_history = self.memory.load(session_id)
+        raw_history = history if history is not None else stored_history
+        if not state.goal:
+            state.goal = next(
+                (
+                    str(item.get("content") or "")[:500]
+                    for item in raw_history or []
+                    if item.get("role") == "user" and item.get("content")
+                ),
+                "",
+            )
+        prepared = self.conversation.prepare(raw_history or [])
+        bounded_history = prepared.history
+        standalone = self._rewrite_query(question, bounded_history)
+        clarification = self.conversation.clarification_question(standalone, state)
+        drift = self.conversation.drift_question(question, state)
+        if clarification or drift:
+            result = AgentAnswer(
+                answer=drift or clarification or "",
+                status="needs_clarification",
+                steps=["Clarifier: 问题信息不足或多轮目标可能偏移，暂停检索"],
+                trace=[
+                    {
+                        "type": "clarification",
+                        "reason": "conversation_drift" if drift else "ambiguous_question",
+                    }
+                ],
+            )
+            return self._finish_request(
+                result,
+                question,
+                raw_history or [],
+                state,
+                prepared.summary,
+                session_id,
+                started,
+            )
         if self.llm.supports_agentic():
             try:
-                return self._ask_agentic(question, history, standalone)
+                result = self._ask_agentic(question, bounded_history, standalone)
             except Exception as exc:  # noqa: BLE001 - 后端不可用时降级，不让请求直接失败
-                fb = self._ask_fallback(question, standalone)
-                fb.steps.insert(0, f"⚠️ agentic 后端调用失败，已降级为本地检索: {exc}")
-                return fb
-        return self._ask_fallback(question, standalone)
+                result = self._ask_fallback(question, standalone)
+                result.steps.insert(0, f"⚠️ agentic 后端调用失败，已降级为本地检索: {exc}")
+        else:
+            result = self._ask_fallback(question, standalone)
+        if prepared.dropped_messages:
+            result.trace.insert(
+                0,
+                {
+                    "type": "context_compaction",
+                    "dropped_messages": prepared.dropped_messages,
+                    "summary_chars": len(prepared.summary),
+                },
+            )
+        return self._finish_request(
+            result,
+            question,
+            raw_history or [],
+            state,
+            prepared.summary,
+            session_id,
+            started,
+        )
+
+    def _finish_request(
+        self,
+        result: AgentAnswer,
+        question: str,
+        history: list[dict],
+        state: ConversationState,
+        summary: str,
+        session_id: str | None,
+        started: float,
+    ) -> AgentAnswer:
+        state = self.conversation.update_state(
+            state,
+            question,
+            result.sources,
+            summary,
+        )
+        if session_id:
+            stored = [
+                *history,
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": result.answer},
+            ]
+            compacted = self.conversation.prepare(stored).history
+            self.memory.save(session_id, state, compacted)
+        result.trace.append(
+            {
+                "type": "request",
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "status": result.status,
+            }
+        )
+        auxiliary = self.llm.consume_usage_events()
+        for event in auxiliary:
+            result.trace.append({"type": "llm_aux", **event})
+        input_tokens = sum(
+            int(event.get("tokens_in", event.get("input_tokens", 0)) or 0)
+            for event in result.trace
+            if event.get("type") in {"llm", "llm_aux"}
+        )
+        output_tokens = sum(
+            int(event.get("tokens_out", event.get("output_tokens", 0)) or 0)
+            for event in result.trace
+            if event.get("type") in {"llm", "llm_aux"}
+        )
+        evaluation = self.settings.evaluation
+        estimated_cost = (
+            input_tokens / 1_000_000 * evaluation.input_price_per_million
+            + output_tokens / 1_000_000 * evaluation.output_price_per_million
+        )
+        result.trace.append(
+            {
+                "type": "usage",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "estimated_cost": round(estimated_cost, 8),
+            }
+        )
+        return result
 
     def _rewrite_query(self, question: str, history: list[dict]) -> str:
         """指代消解 / 查询改写（检索链路 §1）：把依赖上下文的口语问题改写成独立问题。
@@ -103,16 +232,28 @@ class PaperRAGAgent:
         return out
 
     # ---------- agentic 主路径 ----------
-    def _tool_schemas(self) -> list[dict]:
-        return [
-            PaperSearchTool.schema(),
-            ArxivTool.schema(),
-            ArxivIngestTool.schema(),
-            PaperReaderTool.schema(),
-            PDFPageTool.schema(),
-            PDFRegionTool.schema(),
-            ImageSearchTool.schema(),
-        ]
+    def _tool_schemas_for(self, question: str, trace: list[dict]) -> list[dict]:
+        """Progressively expose declarative tool profiles while retaining harness control."""
+
+        allowed = {"search_local_papers", "read_paper_section"}
+        lowered = question.lower()
+        if any(
+            term in lowered
+            for term in ("最新", "近期", "arxiv", "state of the art", "sota")
+        ):
+            allowed.update({"search_arxiv", "ingest_arxiv_papers"})
+        if any(
+            term in lowered
+            for term in ("第", "页", "图", "表", "公式", "bbox", "image", "figure")
+        ):
+            allowed.update(
+                {"read_pdf_page", "read_pdf_region", "search_pdf_images"}
+            )
+        # After one bounded tool observation, allow strategy expansion. Atomic tools
+        # remain visible and every call still passes through ToolHarness.
+        if any(event.get("type") == "tool" for event in trace):
+            allowed = self.tool_registry.names()
+        return self.tool_registry.schemas(allowed)
 
     def _ask_agentic(
         self,
@@ -124,6 +265,9 @@ class PaperRAGAgent:
         standalone = standalone or question
         steps: list[str] = ["Planner: 启动 agentic 检索循环(openai-compatible)"]
         sources: list[dict] = []
+        evidence = EvidenceRegistry(self.settings)
+        verifier = AnswerVerifier(evidence)
+        harness = ToolHarness(self.settings, self.tool_registry, evidence)
         trace: list[dict] = []  # 结构化可观测事件（护栏 #6）
         if prior:
             steps.append(f"Context: 注入 {len(prior)} 条历史轮次")
@@ -141,13 +285,44 @@ class PaperRAGAgent:
         budget_hit = False
 
         for hop in range(self.settings.llm.max_tool_iters):
-            turn = self.llm.create_turn(SYSTEM_PROMPT, history, self._tool_schemas())
+            self._bound_work_history(history, trace)
+            estimated_input = max(
+                1,
+                sum(len(str(message.get("content") or "")) for message in history)
+                // 4,
+            )
+            if (
+                total_tokens
+                + estimated_input
+                + self.settings.llm.max_tokens
+                >= budget
+            ):
+                budget_hit = True
+                steps.append(
+                    f"Budget: 调用前预估将超过 token 预算 {budget}，停止多跳"
+                )
+                trace.append(
+                    {
+                        "type": "budget",
+                        "phase": "preflight",
+                        "estimated_input_tokens": estimated_input,
+                        "total_tokens": total_tokens,
+                        "budget": budget,
+                    }
+                )
+                break
+            turn = self.llm.create_turn(
+                SYSTEM_PROMPT,
+                history,
+                self._tool_schemas_for(standalone, trace),
+            )
             tin = int(turn.usage.get("input_tokens", 0) or 0)
             tout = int(turn.usage.get("output_tokens", 0) or 0)
             total_tokens += tin + tout
             trace.append(
                 {"type": "llm", "step": hop + 1, "tokens_in": tin,
-                 "tokens_out": tout, "total_tokens": total_tokens, "stop": turn.stop}
+                 "tokens_out": tout, "total_tokens": total_tokens, "stop": turn.stop,
+                 "duration_ms": turn.usage.get("duration_ms", 0)}
             )
             self.llm.append_assistant(history, turn)
 
@@ -158,25 +333,54 @@ class PaperRAGAgent:
                     steps.append(f"Budget: token 预算 {budget} 已用尽（累计 {total_tokens}），停止多跳")
                     trace.append({"type": "budget", "total_tokens": total_tokens, "budget": budget})
                     break
-                outcomes = [self._run_tool(tc, sources, steps, trace) for tc in turn.tool_calls]
+                outcomes = [harness.execute(tc, steps, trace) for tc in turn.tool_calls]
+                conflicts = verifier.conflicts()
+                sources = evidence.as_dicts()
+                if conflicts:
+                    trace.append({"type": "evidence_conflict", "items": conflicts})
+                    steps.append(f"Evidence: 检测到 {len(conflicts)} 组潜在冲突，要求显式说明分歧")
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "系统检测到检索来源间可能存在数值或否定关系冲突。"
+                                "请分别陈述各来源结论和适用条件；无法消解时降低结论强度，"
+                                "不得强行合并为单一结论。冲突记录："
+                                f"{conflicts}"
+                            ),
+                        }
+                    )
                 self.llm.append_tool_results(history, outcomes)
+                self._bound_work_history(history, trace)
                 continue
 
             # 模型给出最终答案 -> 生成后回查（护栏 #3）+ 低置信判断（护栏 #4）
-            cleaned, valid_cited, hallucinated = self._check_citations(turn.text, sources)
+            citation_check = verifier.verify(turn.text)
+            cleaned = citation_check.cleaned
+            valid_cited = citation_check.valid
+            hallucinated = citation_check.invalid
+            unsupported = citation_check.unsupported_claims
             low_conf = self._is_low_confidence(sources)
             # 核查失败或低置信，且仍有纠错预算时：反馈给模型，触发有界二次检索
-            if (hallucinated or low_conf) and corrections < max_corrections:
+            if (hallucinated or unsupported or low_conf) and corrections < max_corrections:
                 corrections += 1
-                reason = []
+                reason_parts = []
                 if hallucinated:
-                    reason.append(f"编造引用 {hallucinated}")
+                    reason_parts.append(f"编造引用 {hallucinated}")
                 if low_conf:
-                    reason.append("召回置信偏低")
-                steps.append(f"Verify: 触发第 {corrections} 次二次检索（{'，'.join(reason)}）")
+                    reason_parts.append("召回置信偏低")
+                if unsupported:
+                    reason_parts.append(
+                        f"引用与陈述词面支持不足 {len(unsupported)} 条"
+                    )
+                steps.append(
+                    f"Verify: 触发第 {corrections} 次二次检索"
+                    f"（{'，'.join(reason_parts)}）"
+                )
                 trace.append(
                     {"type": "verify", "result": "recheck", "correction": corrections,
-                     "hallucinated": hallucinated, "low_conf": low_conf}
+                     "hallucinated": hallucinated, "unsupported": unsupported,
+                     "low_conf": low_conf}
                 )
                 history.append(
                     {"role": "user", "content": self._correction_feedback(hallucinated, low_conf)}
@@ -209,6 +413,42 @@ class PaperRAGAgent:
             steps=steps,
             sources=sources,  # 保留每条带唯一 id 的来源，前端按 [S编号] 映射
             trace=trace,
+        )
+
+    def _bound_work_history(
+        self,
+        history: list[dict],
+        trace: list[dict],
+    ) -> None:
+        """Bound message content while preserving tool-call/result ordering."""
+
+        limit = self.settings.harness.context_max_chars
+        total = sum(len(str(message.get("content") or "")) for message in history)
+        if total <= limit:
+            return
+        original = total
+        per_tool = max(1000, self.settings.harness.tool_result_max_chars // 2)
+        for message in history:
+            content = str(message.get("content") or "")
+            if message.get("role") == "tool" and len(content) > per_tool:
+                message["content"] = content[:per_tool] + "\n[tool result truncated]"
+        total = sum(len(str(message.get("content") or "")) for message in history)
+        for message in history:
+            if total <= limit:
+                break
+            content = str(message.get("content") or "")
+            if not content:
+                continue
+            keep = max(200, len(content) - (total - limit))
+            message["content"] = content[-keep:]
+            total = sum(len(str(item.get("content") or "")) for item in history)
+        trace.append(
+            {
+                "type": "context_budget",
+                "before_chars": original,
+                "after_chars": total,
+                "limit": limit,
+            }
         )
 
     def _summarize(
@@ -251,13 +491,25 @@ class PaperRAGAgent:
         min_confident_sources 条。比单点 max<阈值 更稳，且与 reranker 量纲解耦。
         仅 arxiv 摘要 / 章节精读这类无可比分数（score=None）的来源不据此判定。
         """
-        scores = [s["score"] for s in sources if s.get("score") is not None]
-        if not scores:
+        confidences = [
+            float(s["confidence"])
+            for s in sources
+            if s.get("confidence") is not None
+        ]
+        if not confidences:
+            scores = [s["score"] for s in sources if s.get("score") is not None]
+            confidences = [_sigmoid(score) for score in scores]
+        if not confidences:
             return False
         rcfg = self.settings.retrieval
-        confs = [_sigmoid(s) for s in scores]
-        top_ok = max(confs) >= rcfg.low_confidence_threshold
-        count_ok = sum(c >= rcfg.weak_confidence_threshold for c in confs) >= rcfg.min_confident_sources
+        top_ok = max(confidences) >= rcfg.low_confidence_threshold
+        count_ok = (
+            sum(
+                confidence >= rcfg.weak_confidence_threshold
+                for confidence in confidences
+            )
+            >= rcfg.min_confident_sources
+        )
         return not (top_ok and count_ok)
 
     def _answerability_status(
@@ -281,6 +533,15 @@ class PaperRAGAgent:
         return True, "证据充分"
 
     def _source_meets_answerability_score(self, source: dict) -> bool:
+        confidence = source.get("confidence")
+        if confidence is not None:
+            try:
+                return (
+                    float(confidence)
+                    >= self.settings.retrieval.answerability_min_confidence
+                )
+            except (TypeError, ValueError):
+                return False
         score = source.get("score")
         if score is None:
             return True
@@ -338,76 +599,6 @@ class PaperRAGAgent:
             steps.append(f"引用核查: {len(valid_cited)} 条引用均可溯源 {valid_cited}")
         return cleaned
 
-    def _run_tool(
-        self, tool_call: ToolCall, sources: list[dict], steps: list[str], trace: list[dict]
-    ) -> ToolOutcome:
-        """经 harness 执行单个工具（护栏 #1）：schema 校验 → 超时 → 重试 → 记 trace。
-
-        任何失败都转成 error outcome 回传给模型由其调整策略，绝不抛裸异常中断循环。
-        """
-        name = tool_call.name
-        tool_input = tool_call.input
-        event: dict = {
-            "type": "tool", "tool": name, "input": tool_input,
-            "attempts": 0, "ok": False, "duration_ms": 0.0, "n_sources": 0, "error": None,
-        }
-        if name not in self._tools:
-            event["error"] = "未知工具"
-            trace.append(event)
-            steps.append(f"Tool[{name}] 未知工具")
-            return ToolOutcome(tool_call, f"未知工具: {name}", is_error=True)
-
-        tool = self._tools[name]
-        schema_err = self._validate_input(tool, tool_input)
-        if schema_err:
-            event["error"] = f"schema: {schema_err}"
-            trace.append(event)
-            steps.append(f"Tool[{name}] 入参校验失败: {schema_err}")
-            return ToolOutcome(tool_call, f"入参不合法: {schema_err}", is_error=True)
-
-        # 按工具覆盖超时：含网络下载 + 嵌入推理的工具（如 ingest_arxiv_papers）需更长有界超时
-        timeout = getattr(tool, "timeout_seconds", None) or self.settings.harness.tool_timeout_seconds
-        retries = self.settings.harness.tool_max_retries
-        start = time.perf_counter()
-        last_err = None
-        for attempt in range(1, retries + 2):  # 首次 + retries 次重试
-            event["attempts"] = attempt
-            # 不用 with：超时后须立即返回，不能在 shutdown(wait=True) 上阻塞等卡住的线程跑完。
-            # Python 无法强杀线程，但 wait=False 让我们停止等待；每次重试新建池避免排队。
-            ex = ThreadPoolExecutor(max_workers=1)
-            try:
-                # _id_base 让本轮检索到的 chunk 获得跨多次调用全局唯一的 [S编号]
-                fut = ex.submit(tool.run, _id_base=len(sources), **tool_input)
-                result = fut.result(timeout=timeout)
-                sources.extend(result.sources)
-                event.update(
-                    ok=True, n_sources=len(result.sources),
-                    duration_ms=round((time.perf_counter() - start) * 1000, 1),
-                )
-                trace.append(event)
-                steps.append(f"Tool[{name}] {tool_input} -> {len(result.sources)} 来源")
-                return ToolOutcome(tool_call, result.text)
-            except FutureTimeout:
-                last_err = f"超时(>{timeout}s)"
-            except Exception as exc:  # noqa: BLE001 - 失败回传给模型，由其调整策略
-                last_err = str(exc)
-            finally:
-                ex.shutdown(wait=False, cancel_futures=True)
-
-        event.update(error=last_err, duration_ms=round((time.perf_counter() - start) * 1000, 1))
-        trace.append(event)
-        steps.append(f"Tool[{name}] 失败（{event['attempts']} 次）: {last_err}")
-        return ToolOutcome(tool_call, f"工具执行失败: {last_err}", is_error=True)
-
-    @staticmethod
-    def _validate_input(tool, tool_input: dict) -> str | None:
-        """按工具 JSON schema 校验入参，返回错误信息或 None。"""
-        try:
-            jsonschema.validate(tool_input, tool.schema()["input_schema"])
-            return None
-        except jsonschema.ValidationError as exc:
-            return exc.message
-
     @staticmethod
     def _summary_prompt(question: str, sources: list[dict]) -> str:
         refs = "\n".join(
@@ -433,29 +624,6 @@ class PaperRAGAgent:
         return f"｜页码 {start}-{end}"
 
     # ---------- 降级 RAG ----------
-    @staticmethod
-    def _results_to_sources(results) -> list[dict]:
-        return [
-            {
-                "id": f"S{i}",
-                "chunk_id": r.chunk.chunk_id,
-                "paper_id": r.chunk.paper_id,
-                "paper_title": r.chunk.paper_title,
-                "section": r.chunk.section,
-                "source": r.chunk.source,
-                "page_start": r.chunk.page_start,
-                "page_end": r.chunk.page_end,
-                "element_type": r.chunk.element_type,
-                "modality": r.chunk.modality,
-                "bbox": r.chunk.bbox,
-                "chunk_context": r.chunk.chunk_context,
-                "heading_path": r.chunk.heading_path,
-                "score": round(float(r.score), 4),
-                "snippet": r.chunk.content[:600],
-            }
-            for i, r in enumerate(results, start=1)
-        ]
-
     @staticmethod
     def _top_score(results) -> float:
         return max((float(r.score) for r in results), default=float("-inf"))
@@ -486,17 +654,17 @@ class PaperRAGAgent:
         if standalone and standalone != question:
             steps.append(f"Rewriter: 指代消解 → {standalone}")
 
-        results = self.search_tool.retriever.search(query)
+        results = self.fallback.retrieve(query)
         steps.append(f"Retriever: 召回 {len(results)} 个片段（降级 RAG 模式）")
-        sources = self._results_to_sources(results)
+        sources = self.fallback.sources(results)
 
         # 低置信 → 有界一次纠错：改写查询再检索一次，取置信更高者（受 max_corrections 约束）
         if self._is_low_confidence(sources) and self.settings.retrieval.max_corrections > 0:
             new_q = self._reformulate(query)
             if new_q:
-                retry = self.search_tool.retriever.search(new_q)
+                retry = self.fallback.retrieve(new_q)
                 if retry and self._top_score(retry) > self._top_score(results):
-                    results, sources = retry, self._results_to_sources(retry)
+                    results, sources = retry, self.fallback.sources(retry)
                     steps.append(f"Corrective: 低置信，改写为「{new_q}」二次检索（采用更优结果）")
                     trace.append({"type": "verify", "result": "recheck", "mode": "fallback"})
                 else:
@@ -517,8 +685,27 @@ class PaperRAGAgent:
         answer = self.llm.generate(prompt)
         steps.append("Generator: 生成答案")
 
-        # 引用回查 + 定稿：剔除编造引用、按情况下调结论强度（与 agentic 主路径同口径）
-        cleaned, valid_cited, hallucinated = self._check_citations(answer, sources)
+        # 引用回查 + claim 支持度核查（与 agentic 主路径同口径）
+        fallback_evidence = EvidenceRegistry(self.settings)
+        fallback_evidence.seed_dicts(sources)
+        fallback_verifier = AnswerVerifier(fallback_evidence)
+        checked = fallback_verifier.verify(answer)
+        conflicts = fallback_verifier.conflicts()
+        cleaned, valid_cited, hallucinated = (
+            checked.cleaned,
+            checked.valid,
+            checked.invalid,
+        )
+        if checked.unsupported_claims:
+            steps.append(
+                f"ClaimVerify: {len(checked.unsupported_claims)} 条陈述需要人工复核"
+            )
+            trace.append(
+                {
+                    "type": "claim_verify",
+                    "unsupported": checked.unsupported_claims,
+                }
+            )
         answerable, reason = self._answerability_status(sources, valid_cited)
         if not answerable:
             steps.append(f"Answerability: {reason}，拒绝生成实质答案")
@@ -530,6 +717,12 @@ class PaperRAGAgent:
                 trace=trace,
             )
         answer = self._finalize(cleaned, valid_cited, hallucinated, sources, steps)
+        if conflicts:
+            answer += (
+                "\n\n> 检测到来源之间可能存在数值或否定关系冲突；"
+                "请分别核对相关论文的实验条件，不将其视为一致结论。"
+            )
+            trace.append({"type": "evidence_conflict", "items": conflicts})
         trace.append(
             {"type": "verify", "result": "final", "valid": valid_cited, "hallucinated": hallucinated}
         )

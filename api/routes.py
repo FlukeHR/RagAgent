@@ -9,15 +9,17 @@ from agent.graph import PaperRAGAgent
 from api.schemas import (
     AskRequest,
     AskResponse,
+    ConversationResponse,
     IngestArxivRequest,
     IngestArxivResponse,
+    SourceItem,
     TitleRequest,
     TitleResponse,
+    Turn,
 )
-from config.settings import BASE_DIR, load_settings
+from config.settings import load_settings
 from llm.model import LLMClient
-from retrieval.vector_store import VectorStore
-from tools import ArxivIngestTool, ArxivTool
+from services import ArxivSearchService, PaperLibraryService
 
 router = APIRouter()
 
@@ -32,7 +34,11 @@ def ask(req: AskRequest) -> AskResponse:
     try:
         agent = _get_agent()
         history = [turn.model_dump() for turn in req.history]
-        result = agent.ask(req.question, history=history)
+        result = agent.ask(
+            req.question,
+            history=history,
+            session_id=req.session_id,
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -40,8 +46,9 @@ def ask(req: AskRequest) -> AskResponse:
 
     return AskResponse(
         answer=result.answer,
+        status=result.status,
         steps=result.steps,
-        sources=result.sources,
+        sources=[SourceItem.model_validate(source) for source in result.sources],
         trace=result.trace,
     )
 
@@ -99,15 +106,11 @@ def ingest_arxiv(req: IngestArxivRequest) -> IngestArxivResponse:
     """下载 arXiv PDF 到统一论文库并增量重建索引。"""
     settings = load_settings()
     try:
-        search_result = ArxivTool(settings).run(
+        papers = ArxivSearchService(settings).search(
             req.query,
             max_results=req.max_results,
         )
-        arxiv_ids = [
-            source["paper_id"]
-            for source in search_result.sources
-            if source.get("paper_id")
-        ]
+        arxiv_ids = [paper.arxiv_id for paper in papers]
         arxiv_ids = arxiv_ids[: settings.arxiv.max_ingest_papers]
         if not arxiv_ids:
             raise HTTPException(
@@ -115,22 +118,15 @@ def ingest_arxiv(req: IngestArxivRequest) -> IngestArxivResponse:
                 detail="arXiv 未检索到可下载论文",
             )
 
-        ArxivIngestTool(settings).run(arxiv_ids, req.query)
-        data_dir = BASE_DIR / settings.project.data_root
-        downloaded = [
-            paper_id
-            for paper_id in arxiv_ids
-            if (data_dir / f"{paper_id}.pdf").exists()
-        ]
+        report = PaperLibraryService(settings).ingest_arxiv(arxiv_ids)
+        downloaded = [*report.downloaded, *report.reused]
         if not downloaded:
             raise HTTPException(
                 status_code=502,
                 detail="arXiv 论文下载失败",
             )
 
-        store = VectorStore(str(BASE_DIR / settings.index.index_root))
-        store.load()
-        indexed_chunks = len(store.chunks)
+        indexed_chunks = report.indexed_chunks
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -141,3 +137,24 @@ def ingest_arxiv(req: IngestArxivRequest) -> IngestArxivResponse:
         downloaded=downloaded,
         indexed_chunks=indexed_chunks,
     )
+
+
+@router.get("/sessions/{session_id}", response_model=ConversationResponse)
+def get_session(session_id: str) -> ConversationResponse:
+    try:
+        state, history = _get_agent().memory.load(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ConversationResponse(
+        session_id=session_id,
+        state=state.__dict__,
+        history=[Turn.model_validate(item) for item in history],
+    )
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def delete_session(session_id: str) -> None:
+    try:
+        _get_agent().memory.delete(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -9,12 +9,15 @@ index:
   chunk_overlap: 150
   top_k_recall: 12
   top_n_rerank: 5
+  rrf_k: 60
+  max_chunks_per_parent: 2
 
 # 模型名写 HF 全名即可：若 models/<名> 下有本地副本则自动优先用本地（离线、可移植），
 # 否则回退在线下载（见 config/settings.py:resolve_model_path）。
 embedding:
   model_name: sentence-transformers/all-MiniLM-L6-v2
   use_sentence_transformers: true
+  fallback_dimension: 384
 
 rerank:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
@@ -29,9 +32,13 @@ retrieval:
   min_confident_sources: 1         # 概率≥弱阈值的来源至少这么多条
   answerability_min_sources: 1     # 硬闸：低置信/二次检索后仍少于 N 条有效来源则拒答
   answerability_min_score: 0.0     # 可比分数最低要求；score=None 的精读/页面工具来源按有效来源处理
+  answerability_min_confidence: 0.25
   answerability_require_citation: true
   # 引用核查失败 / 低置信时，自动二次检索的最大次数（有界，避免无限多跳）。
   max_corrections: 1
+  cjk_ngram_size: 2
+  deduplicate_evidence: true
+  conflict_detection: true
 
 pdf_parse:
   # provider: pymupdf | tesseract（tesseract 为可选本地 OCR runtime，缺失时自动降级）
@@ -43,6 +50,7 @@ image_search:
   enabled: true
   max_pages: 80
   max_side: 256
+  max_query_base64_chars: 2000000
 
 llm:
   model_name: deepseek-v4-flash
@@ -51,6 +59,9 @@ llm:
   openai_api_base: "https://api.deepseek.com"
   # 密钥绝不写进此文件：留空，从环境变量 OPENAI_API_KEY 读取（见 llm/model.py）
   openai_api_key: ""
+  request_timeout_seconds: 120
+  connect_timeout_seconds: 30
+  max_retries: 2
 
 arxiv:
   max_results: 5
@@ -59,8 +70,30 @@ arxiv:
   ingest_timeout_seconds: 120   # 下载+增量嵌入+重检索的专属超时（含网络/推理）
   max_papers: 200               # 在线入库论文容量上限；手动放入 papers 的论文不自动淘汰；0=不限
   max_age_days: 0               # 超 N 天未被检索命中即淘汰；0=不按龄期淘汰
+  request_timeout_seconds: 60   # arXiv 搜索/下载单次网络请求超时
 
 harness:
   tool_timeout_seconds: 30   # 单次工具调用超时
   tool_max_retries: 1        # 工具失败/超时的重试次数
   token_budget: 60000        # 累计 input+output token 上限，超出则停止多跳
+  tool_result_max_chars: 24000
+  source_snippet_chars: 600
+  image_base64_chars: 12000
+  history_max_messages: 12
+  history_max_chars: 12000
+  history_summary_max_chars: 2000
+  context_max_chars: 60000
+  clarification_enabled: true
+  memory_ttl_seconds: 604800
+  memory_max_sessions: 500
+  memory_db_path: ./data/sessions.sqlite3
+  clarification_min_chars: 6
+  recent_history_messages: 8
+  claim_support_min_overlap: 0.12
+  pdf_page_max_side: 2400
+  pdf_region_max_side: 1600
+
+evaluation:
+  # 由实际供应商价格填写；0 表示评测时只统计 token，不换算费用。
+  input_price_per_million: 0
+  output_price_per_million: 0

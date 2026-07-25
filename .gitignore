@@ -13,12 +13,16 @@ venv/
 
 # Runtime index artifacts
 /data/indexes/**
+/data/*.sqlite3*
 
 # 评估数据集（QASPER 等，体积大，本地下载不入库）
 /evaluation/data/**
 !/evaluation/data/qasper/README.md
 !/evaluation/data/pdf_grounding/
 !/evaluation/data/pdf_grounding/*.json
+!/evaluation/data/business_cases.jsonl
+!/evaluation/data/badcases.jsonl
+/evaluation/results/**
 
 # Local logs
 *.log

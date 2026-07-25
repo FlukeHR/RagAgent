@@ -12,6 +12,9 @@
 - OCR/VLM/table/figure/formula sidecar 入索引。
 - arXiv 摘要侦察、全文按需入库、增量索引和 LRU 容量治理。
 - 多轮历史注入、指代消解、多会话前端和结构化 trace。
+- 模糊问题主动澄清、主题偏移确认、滚动摘要与 SQLite 服务端会话记忆。
+- 版本化原子索引快照、实际 embedding 指纹校验和索引热重载。
+- 结构化 Evidence、重复证据抑制、claim 支持度检查和潜在冲突提示。
 - 无可用模型接口时降级为本地检索 RAG。
 
 ## 请求链路
@@ -146,10 +149,17 @@ curl -X POST http://127.0.0.1:8000/ask \
 ```bash
 python evaluation/eval_qasper.py --sweep
 RAG_EVAL_ALLOW_API=1 python evaluation/eval_generation.py --limit 20
+python evaluation/benchmark_retrieval.py
+python evaluation/benchmark_grounded.py
+python evaluation/benchmark_e2e.py --yes
 ```
 
 - `eval_qasper.py`：Hit@k、MRR、nDCG、Recall。
 - `eval_generation.py`：RAGAS faithfulness、answer relevancy、context precision 等。
+- `benchmark_retrieval.py`：Dense/BM25/Hybrid/Rerank 消融和 top-k/top-n sweep。
+- `benchmark_grounded.py`：在真实论文库 gold evidence 上比较 chunk/top-k。
+- `benchmark_e2e.py`：端到端延迟、first-byte、token 和成本汇总。
+- `audit_citations.py`：导出 claim/source 对供人工幻觉审计。
 
 RAGAS 会调用真实 API，必须显式授权。
 
@@ -166,7 +176,7 @@ RAGAS 会调用真实 API，必须显式授权。
 
 ## 已知限制
 
-- 会话只保存在浏览器 `localStorage`。
+- 会话同时保存在浏览器 `localStorage` 和有 TTL/容量上限的本地 SQLite；当前仍是单用户部署模型，没有账号级权限系统。
 - 主检索仍以文本 embedding 为主。
 - 图像检索是离线签名 fallback，不是 CLIP/SigLIP。
 - 论文库写锁只在单进程内有效。

@@ -1,95 +1,155 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
 
 import numpy as np
 
 from config.settings import Settings
+from retrieval.analyzer import QueryAnalyzer
 from retrieval.chunker import Chunk
 from retrieval.embedder import Embedder
+from retrieval.pipeline import RetrievalPipeline, RetrievalResult
 from retrieval.reranker import Reranker
 from retrieval.vector_store import VectorStore
 
 
-@dataclass
-class RetrievalResult:
-    chunk: Chunk
-    score: float
-
-
 class Retriever:
-    """稠密向量 + BM25 混合召回（RRF 融合）+ 可选重排，面向论文 chunk。"""
+    """Filterable Dense + BM25 + RRF + diversification + reranking pipeline."""
 
     def __init__(self, settings: Settings, index_dir: str) -> None:
         self.settings = settings
+        self.analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
         self.embedder = Embedder(
-            model_name=settings.embedding.model_name,
-            use_sentence_transformers=settings.embedding.use_sentence_transformers,
+            settings.embedding.model_name,
+            settings.embedding.use_sentence_transformers,
+            settings.embedding.fallback_dimension,
         )
         self.store = VectorStore(index_dir=index_dir)
         self.reranker = Reranker(
-            model_name=settings.rerank.model_name,
-            use_cross_encoder=settings.rerank.use_cross_encoder,
+            settings.rerank.model_name,
+            settings.rerank.use_cross_encoder,
+            analyzer=self.analyzer,
         )
-        self._bm25 = None  # 懒构建：首次检索时用 store.chunks 现建并缓存
+        self.pipeline = RetrievalPipeline(
+            self.reranker,
+            settings.index.rrf_k,
+            settings.index.max_chunks_per_parent,
+        )
+        self._bm25 = None
+        self._bm25_generation: str | None = None
+        self.last_trace: dict[str, float | str | int] = {}
 
-    @staticmethod
-    def _tokenize(text: str) -> list[str]:
-        return text.lower().split()
+    def _ensure_store(self) -> None:
+        if self.store.generation is None:
+            self.store.load(self.embedder.signature)
+        elif self.store.reload_if_changed(self.embedder.signature):
+            self._bm25 = None
+            self._bm25_generation = None
 
     def _bm25_index(self):
-        """查询时用 store.chunks 现建 BM25（论文集合不大，开销可忽略）。
-
-        rank_bm25 不可用或无语料时返回 None，检索自动退化为纯稠密向量。
-        """
-        if self._bm25 is None:
-            if not self.store.chunks:
-                self.store.load()
-            corpus = [self._tokenize(c.content) for c in self.store.chunks]
+        self._ensure_store()
+        if self._bm25_generation != self.store.generation:
             try:
                 from rank_bm25 import BM25Okapi
 
-                self._bm25 = BM25Okapi(corpus) if corpus else False
+                corpus = [self.analyzer.tokens(chunk.content) for chunk in self.store.chunks]
+                self._bm25 = BM25Okapi(corpus) if corpus else None
             except ImportError:
-                self._bm25 = False
-        return self._bm25 or None
+                self._bm25 = None
+            self._bm25_generation = self.store.generation
+        return self._bm25
+
+    def _allowed_indices(
+        self,
+        paper_ids: set[str] | None,
+        modalities: set[str] | None,
+        element_types: set[str] | None,
+    ) -> list[int]:
+        return [
+            index
+            for index, chunk in enumerate(self.store.chunks)
+            if (paper_ids is None or chunk.paper_id in paper_ids)
+            and (modalities is None or chunk.modality in modalities)
+            and (element_types is None or chunk.element_type in element_types)
+        ]
 
     @staticmethod
     def _rrf_fuse(
-        ranked_lists: list[list[tuple[Chunk, float]]], k: int = 60
+        ranked_lists: list[list[tuple[Chunk, float]]],
+        k: int = 60,
     ) -> list[tuple[Chunk, float]]:
-        """Reciprocal Rank Fusion：按各路名次倒数求和，无需调权重、对分数量纲不敏感。"""
-        scores: dict[str, float] = {}
-        chunk_by_id: dict[str, Chunk] = {}
-        for lst in ranked_lists:
-            for rank, (chunk, _) in enumerate(lst):
-                cid = chunk.chunk_id
-                chunk_by_id[cid] = chunk
-                scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-        fused = sorted(
-            ((chunk_by_id[cid], sc) for cid, sc in scores.items()),
-            key=lambda x: x[1],
-            reverse=True,
+        """Compatibility helper retained for external callers."""
+
+        from retrieval.pipeline import ReciprocalRankFusion
+
+        return ReciprocalRankFusion(k).fuse(ranked_lists)
+
+    def search(
+        self,
+        query: str,
+        *,
+        paper_ids: set[str] | None = None,
+        modalities: set[str] | None = None,
+        element_types: set[str] | None = None,
+        mode: str = "hybrid",
+        use_reranker: bool = True,
+        top_k: int | None = None,
+        top_n: int | None = None,
+    ) -> list[RetrievalResult]:
+        started = time.perf_counter()
+        self._ensure_store()
+        loaded_at = time.perf_counter()
+        recall_limit = top_k or self.settings.index.top_k_recall
+        output_limit = top_n or self.settings.index.top_n_rerank
+        allowed = self._allowed_indices(paper_ids, modalities, element_types)
+        query_vector = self.embedder.encode([query])
+        embedded_at = time.perf_counter()
+        dense = (
+            self.store.search(query_vector, recall_limit, allowed)
+            if mode in {"dense", "hybrid"}
+            else []
         )
-        return fused
+        dense_at = time.perf_counter()
 
-    def search(self, query: str) -> list[RetrievalResult]:
-        top_k = self.settings.index.top_k_recall
-        q_vec = self.embedder.encode([query])
-        dense = self.store.search(q_vec, top_k=top_k)
-
-        bm25 = self._bm25_index()
-        if bm25 is not None:
-            bm25_scores = bm25.get_scores(self._tokenize(query))
-            top_idx = np.argsort(-bm25_scores)[:top_k]
-            sparse = [
-                (self.store.chunks[int(i)], float(bm25_scores[int(i)])) for i in top_idx
-            ]
-            candidates = self._rrf_fuse([dense, sparse])[:top_k]
-        else:
-            candidates = dense
-
-        reranked = self.reranker.rerank(
-            query, candidates, top_n=self.settings.index.top_n_rerank
+        sparse: list[tuple[Chunk, float]] | None = None
+        if mode in {"sparse", "hybrid"}:
+            bm25 = self._bm25_index()
+            if bm25 is not None:
+                scores = bm25.get_scores(self.analyzer.tokens(query))
+                indices = np.asarray(allowed, dtype=np.int64)
+                order: list[int] | np.ndarray = (
+                    indices[np.argsort(-scores[indices])[:recall_limit]]
+                    if len(indices)
+                    else []
+                )
+                sparse = [
+                    (self.store.chunks[int(index)], float(scores[int(index)]))
+                    for index in order
+                ]
+            else:
+                sparse = []
+        if mode == "sparse":
+            dense, sparse = sparse or [], None
+        if mode not in {"dense", "sparse", "hybrid"}:
+            raise ValueError(f"unknown retrieval mode: {mode}")
+        recalled_at = time.perf_counter()
+        results = self.pipeline.run(
+            dense,
+            sparse,
+            query,
+            recall_limit,
+            output_limit,
+            use_reranker=use_reranker,
         )
-        return [RetrievalResult(chunk=chunk, score=score) for chunk, score in reranked]
+        finished = time.perf_counter()
+        self.last_trace = {
+            "mode": mode,
+            "store_ms": round((loaded_at - started) * 1000, 2),
+            "embed_ms": round((embedded_at - loaded_at) * 1000, 2),
+            "dense_ms": round((dense_at - embedded_at) * 1000, 2),
+            "sparse_ms": round((recalled_at - dense_at) * 1000, 2),
+            "fusion_rerank_ms": round((finished - recalled_at) * 1000, 2),
+            "total_ms": round((finished - started) * 1000, 2),
+            "results": len(results),
+        }
+        return results

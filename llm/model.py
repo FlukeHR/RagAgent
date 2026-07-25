@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,11 @@ class LLMClient:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self._usage_events: list[dict[str, Any]] = []
+
+    def consume_usage_events(self) -> list[dict[str, Any]]:
+        events, self._usage_events = self._usage_events, []
+        return events
 
     # ---------- 可用性 ----------
     def _openai_configured(self) -> bool:
@@ -103,8 +109,11 @@ class LLMClient:
         return OpenAI(
             api_key=self.config.openai_api_key or os.getenv("OPENAI_API_KEY") or "not-needed",
             base_url=self.config.openai_api_base or None,
-            timeout=httpx.Timeout(120.0, connect=30.0),
-            max_retries=2,
+            timeout=httpx.Timeout(
+                self.config.request_timeout_seconds,
+                connect=self.config.connect_timeout_seconds,
+            ),
+            max_retries=self.config.max_retries,
         )
 
     @staticmethod
@@ -126,6 +135,7 @@ class LLMClient:
     ) -> LLMTurn:
         client = self._openai_client()
         messages = [{"role": "system", "content": system}, *history]
+        started = time.perf_counter()
         resp = client.chat.completions.create(
             model=self.config.model_name,
             max_tokens=self.config.max_tokens,
@@ -165,6 +175,7 @@ class LLMClient:
             usage={
                 "input_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
                 "output_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
             },
         )
 
@@ -179,6 +190,7 @@ class LLMClient:
 
     def _generate_openai(self, prompt: str, system: str) -> str:
         client = self._openai_client()
+        started = time.perf_counter()
         response = client.chat.completions.create(
             model=self.config.model_name,
             max_tokens=self.config.max_tokens,
@@ -186,6 +198,15 @@ class LLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+        )
+        usage = getattr(response, "usage", None)
+        self._usage_events.append(
+            {
+                "operation": "generate",
+                "input_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                "output_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            }
         )
         return response.choices[0].message.content or ""
 

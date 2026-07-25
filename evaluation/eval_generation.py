@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import load_settings, resolve_model_path
+from evaluation.eval_qasper import result_metadata
 
 DEFAULT_QASPER = PROJECT_ROOT / "evaluation" / "data" / "qasper" / "qasper-dev-v0.3.json"
 
@@ -69,25 +70,27 @@ def qasper_reference(qa: dict) -> str | None:
     return None
 
 
-def _retrieve_chunks(query, chunks, vecs, bm25, embedder, reranker, settings, top_n):
+def _retrieve_chunks(query, chunks, vecs, embedder, reranker, settings, top_n):
     """在单篇论文的段落里检索 top_n（稠密+BM25 RRF→重排），与生产/eval_qasper 同构。"""
-    import numpy as np
+    from retrieval.analyzer import QueryAnalyzer
+    from retrieval.pipeline import rank_in_memory
 
-    from retrieval.retriever import Retriever
-
-    top_k = settings.index.top_k_recall
-    qv = embedder.encode([query])[0]
-    dense = np.asarray(vecs) @ qv
-    didx = np.argsort(-dense)[:top_k]
-    dlist = [(chunks[int(i)], float(dense[int(i)])) for i in didx]
-    if bm25 is not None:
-        bs = bm25.get_scores(query.lower().split())
-        sidx = np.argsort(-bs)[:top_k]
-        slist = [(chunks[int(i)], float(bs[int(i)])) for i in sidx]
-        cands = Retriever._rrf_fuse([dlist, slist])[:top_k]
-    else:
-        cands = dlist
-    return [c for c, _ in reranker.rerank(query, cands, top_n=top_n)]
+    analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
+    results = rank_in_memory(
+        query,
+        chunks,
+        vecs,
+        embedder.encode([query])[0],
+        analyzer=analyzer,
+        reranker=reranker,
+        top_k=settings.index.top_k_recall,
+        top_n=top_n,
+        mode="hybrid",
+        use_reranker=True,
+        rrf_k=settings.index.rrf_k,
+        max_chunks_per_parent=settings.index.max_chunks_per_parent,
+    )
+    return [result.chunk for result in results]
 
 
 def _gen_prompt(question: str, chunks) -> str:
@@ -104,13 +107,20 @@ def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = Non
     from retrieval.embedder import Embedder
     from retrieval.reranker import Reranker
 
-    embedder = Embedder(settings.embedding.model_name, settings.embedding.use_sentence_transformers)
-    reranker = Reranker(settings.rerank.model_name, settings.rerank.use_cross_encoder)
+    from retrieval.analyzer import QueryAnalyzer
+
+    analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
+    embedder = Embedder(
+        settings.embedding.model_name,
+        settings.embedding.use_sentence_transformers,
+        settings.embedding.fallback_dimension,
+    )
+    reranker = Reranker(
+        settings.rerank.model_name,
+        settings.rerank.use_cross_encoder,
+        analyzer=analyzer,
+    )
     top_n = top_n or settings.index.top_n_rerank
-    try:
-        from rank_bm25 import BM25Okapi
-    except ImportError:
-        BM25Okapi = None
 
     samples: list[dict] = []
     for paper in dataset.values():
@@ -118,12 +128,19 @@ def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = Non
         if len(chunks) < 2:
             continue
         vecs = embedder.encode([c.content for c in chunks])
-        bm25 = BM25Okapi([c.content.lower().split() for c in chunks]) if BM25Okapi else None
         for qa in paper.get("qas", []):
             ref = qasper_reference(qa)
             if not ref:  # 跳过 unanswerable / 无可用参考答案
                 continue
-            top = _retrieve_chunks(qa["question"], chunks, vecs, bm25, embedder, reranker, settings, top_n)
+            top = _retrieve_chunks(
+                qa["question"],
+                chunks,
+                vecs,
+                embedder,
+                reranker,
+                settings,
+                top_n,
+            )
             response = llm.generate(_gen_prompt(qa["question"], top))
             samples.append({
                 "user_input": qa["question"],
@@ -201,6 +218,11 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=None, help="评估问题数上限")
     parser.add_argument("--yes", action="store_true", help="确认调用真实 API（等价 RAG_EVAL_ALLOW_API=1）")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evaluation/results/generation_evaluation.json"),
+    )
     args = parser.parse_args()
 
     if not authorized(args.yes):
@@ -226,10 +248,11 @@ def main() -> None:
     from llm.model import LLMClient
 
     print("[GenEval] QASPER 模式，收集样本（openai-compatible）…")
+    llm = LLMClient(settings.llm)
     samples = collect_samples_qasper(
         json.loads(qpath.read_text(encoding="utf-8")),
         settings,
-        LLMClient(settings.llm),
+        llm,
         args.limit,
     )
 
@@ -240,14 +263,40 @@ def main() -> None:
     judge_llm, judge_emb = _build_judge(settings)
     dataset = EvaluationDataset.from_list(samples)
     print(f"[GenEval] 评分 {len(samples)} 条样本…")
-    result = evaluate(
-        dataset=dataset,
-        metrics=_metrics(with_reference=True),
-        llm=judge_llm,
-        embeddings=judge_emb,
-    )
+    judge_usage = {}
+    try:
+        from langchain_core.callbacks import get_usage_metadata_callback
+
+        with get_usage_metadata_callback() as callback:
+            result = evaluate(
+                dataset=dataset,
+                metrics=_metrics(with_reference=True),
+                llm=judge_llm,
+                embeddings=judge_emb,
+            )
+        judge_usage = callback.usage_metadata
+    except ImportError:
+        result = evaluate(
+            dataset=dataset,
+            metrics=_metrics(with_reference=True),
+            llm=judge_llm,
+            embeddings=judge_emb,
+        )
     print("\n===== RAGAS 生成侧评估 =====")
     print(result)
+    payload = {
+        "metadata": result_metadata(settings, qpath),
+        "sample_count": len(samples),
+        "metrics": str(result),
+        "usage": llm.consume_usage_events(),
+        "judge_usage": judge_usage,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[GenEval] saved: {args.output}")
 
 
 if __name__ == "__main__":

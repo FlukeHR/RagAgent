@@ -1,0 +1,5 @@
+{"id":"ambiguous-001","category":"ambiguous_question","question":"哪个更好？","history":[],"expected_status":"needs_clarification","gold_paper_ids":[],"gold_pages":[],"gold_evidence":[],"enabled":true}
+{"id":"multiturn-001","category":"multi_turn_reference","question":"它的实验数据是什么？","history":[{"role":"user","content":"请分析论文 A 的核心方法"},{"role":"assistant","content":"论文 A 使用了一种检索增强方法。"}],"expected_status":"needs_clarification","gold_paper_ids":[],"gold_pages":[],"gold_evidence":[],"enabled":true}
+{"id":"answerable-template","category":"answerable","question":"请替换为你的真实业务问题","history":[],"expected_status":"answered","gold_paper_ids":["replace-with-paper-id"],"gold_pages":[1],"gold_evidence":["replace with an evidence substring"],"enabled":false}
+{"id":"conflict-template","category":"conflicting_evidence","question":"请替换为在两篇论文中存在冲突证据的问题","history":[],"expected_status":"answered","gold_paper_ids":["paper-a","paper-b"],"gold_pages":[],"gold_evidence":[],"enabled":false}
+{"id":"unanswerable-template","category":"unanswerable","question":"请替换为论文库明确无法回答的问题","history":[],"expected_status":"rejected","gold_paper_ids":[],"gold_pages":[],"gold_evidence":[],"enabled":false}

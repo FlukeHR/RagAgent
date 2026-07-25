@@ -1,226 +1,272 @@
-"""QASPER 检索侧评估（离线，不打任何 API）。
+"""Offline QASPER retrieval evaluation; never calls a paid generation API."""
 
-QASPER（Question Answering over Scientific Papers, Allen AI）是面向 NLP 论文的单文档问答数据集，
-每个问题标注了支撑答案的 evidence 段落。本脚本把它当成**检索基准**：对每个可答、且有文本 evidence
-的问题，在其所属论文的段落集合内检索，用 gold evidence 段落算 Hit@k / MRR / nDCG@k / Recall@k。
-
-检索链路与生产一致：稠密向量 + BM25 → RRF 融合 → 可选 CrossEncoder 重排（复用 retrieval/ 下的组件）。
-
-用法：
-    1. 从 https://allenai.org/data/qasper 下载（建议 dev 集），把 `qasper-dev-v0.3.json`
-       放到  evaluation/data/qasper/  下。
-    2. python3 evaluation/eval_qasper.py [json路径] [--limit N] [--no-rerank]
-"""
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import platform
+import subprocess
 import sys
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import numpy as np
-
-from config.settings import load_settings
+from config.settings import Settings, load_settings
+from retrieval.analyzer import QueryAnalyzer
 from retrieval.chunker import Chunk
 from retrieval.embedder import Embedder
+from retrieval.pipeline import rank_in_memory
 from retrieval.reranker import Reranker
-from retrieval.retriever import Retriever
 
-DEFAULT_DATA = PROJECT_ROOT / "evaluation" / "data" / "qasper" / "qasper-dev-v0.3.json"
+DEFAULT_DATA = (
+    PROJECT_ROOT / "evaluation" / "data" / "qasper" / "qasper-dev-v0.3.json"
+)
 
 
 def _paragraphs(paper: dict) -> list[Chunk]:
-    """把一篇论文的 full_text 段落摊平为 Chunk（chunk_id = 段落序号）。"""
     chunks: list[Chunk] = []
-    pid = paper.get("title", "paper")[:60]
+    paper_id = paper.get("title", "paper")[:60]
     for section in paper.get("full_text", []):
-        name = section.get("section_name") or "Body"
-        for para in section.get("paragraphs", []):
-            if para and para.strip():
+        section_name = section.get("section_name") or "Body"
+        for paragraph in section.get("paragraphs", []):
+            if paragraph and paragraph.strip():
                 chunks.append(
                     Chunk(
-                        chunk_id=str(len(chunks)), paper_id=pid, paper_title=pid,
-                        section=name, content=para, source=pid,
+                        chunk_id=str(len(chunks)),
+                        paper_id=paper_id,
+                        paper_title=paper_id,
+                        section=section_name,
+                        content=paragraph,
+                        source=paper_id,
+                        parent_id=f"{paper_id}::{section_name}",
                     )
                 )
     return chunks
 
 
-def _gold_evidence(qa: dict) -> set[str]:
-    """汇总所有标注者的文本 evidence，剔除图表（FLOAT SELECTED）标记。"""
+def _gold_evidence(question: dict) -> set[str]:
     gold: set[str] = set()
-    for ans in qa.get("answers", []):
-        a = ans.get("answer", {})
-        if a.get("unanswerable"):
+    for annotation in question.get("answers", []):
+        answer = annotation.get("answer", {})
+        if answer.get("unanswerable"):
             continue
-        for ev in a.get("evidence", []) or []:
-            if ev and not ev.startswith("FLOAT SELECTED"):
-                gold.add(ev.strip())
+        for evidence in answer.get("evidence", []) or []:
+            if evidence and not evidence.startswith("FLOAT SELECTED"):
+                gold.add(evidence.strip())
     return gold
 
 
-def _sigmoid(x: float) -> float:
-    x = max(-30.0, min(30.0, float(x)))
-    return 1.0 / (1.0 + math.exp(-x))
-
-
-def _retrieve(query: str, chunks, vecs, bm25, embedder, reranker, settings) -> list[tuple[str, float]]:
-    """返回重排后的 (chunk_id, score) 列表（与生产 Retriever.search 同构）。"""
-    top_k = settings.index.top_k_recall
-    qv = embedder.encode([query])[0]
-    dense_scores = vecs @ qv
-    dense_idx = np.argsort(-dense_scores)[:top_k]
-    dense = [(chunks[int(i)], float(dense_scores[int(i)])) for i in dense_idx]
-
-    if bm25 is not None:
-        bs = bm25.get_scores(query.lower().split())
-        sparse_idx = np.argsort(-bs)[:top_k]
-        sparse = [(chunks[int(i)], float(bs[int(i)])) for i in sparse_idx]
-        cands = Retriever._rrf_fuse([dense, sparse])[:top_k]
-    else:
-        cands = dense
-
-    reranked = reranker.rerank(query, cands, top_n=settings.index.top_n_rerank)
-    return [(c.chunk_id, float(sc)) for c, sc in reranked]
-
-
-def _sweep_report(confs: list[float], labels: list[int]) -> None:
-    """阈值扫描：把检索是否命中(Hit@k)当标签，扫强阈值 t，找最能区分
-    「该自信 vs 该二次检索」的点（最大 F1，附 Youden's J）。用于标定 low_confidence_threshold。"""
-    import numpy as _np
-
-    hits = [c for c, y in zip(confs, labels) if y]
-    miss = [c for c, y in zip(confs, labels) if not y]
-    n_pos, n_neg = len(hits), len(miss)
-    print("\n===== low_confidence_threshold 阈值扫描 =====")
-    print(f"样本：命中(应自信) {n_pos} 条，未命中(应二次检索) {n_neg} 条")
-    if hits:
-        print(f"命中相关概率：均值 {sum(hits)/n_pos:.3f}  最小 {min(hits):.3f}")
-    if miss:
-        print(f"未命中相关概率：均值 {sum(miss)/n_neg:.3f}  最大 {max(miss):.3f}")
-    if not n_pos or not n_neg:
-        print("（命中/未命中样本不全，无法标定阈值）")
-        return
-
-    print(f"\n{'t':>5} {'precision':>10} {'recall':>8} {'F1':>7} {'YoudenJ':>8}")
-    best = (None, -1.0)  # (t, F1)
-    best_j = (None, -1.0)
-    for t in _np.linspace(0.0, 1.0, 21):
-        tp = sum(1 for c, y in zip(confs, labels) if c >= t and y)
-        fp = sum(1 for c, y in zip(confs, labels) if c >= t and not y)
-        fn = sum(1 for c, y in zip(confs, labels) if c < t and y)
-        tn = n_neg - fp
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
-        tpr = tp / n_pos
-        tnr = tn / n_neg
-        j = tpr + tnr - 1
-        print(f"{t:5.2f} {prec:10.3f} {rec:8.3f} {f1:7.3f} {j:8.3f}")
-        if f1 > best[1]:
-            best = (t, f1)
-        if j > best_j[1]:
-            best_j = (t, j)
-    print(f"\n推荐 low_confidence_threshold ≈ {best[0]:.2f}（最大 F1={best[1]:.3f}）"
-          f"；或 {best_j[0]:.2f}（最大 Youden's J={best_j[1]:.3f}）")
-
-
-def _metrics(ranked: list[str], gold: set[str], k: int) -> tuple[float, float, float, float]:
-    """Hit@k / MRR / nDCG@k / Recall@k（二值相关）。"""
-    topk = ranked[:k]
-    rels = [1 if cid in gold else 0 for cid in topk]
-    hit = 1.0 if any(rels) else 0.0
-    mrr = 0.0
-    for i, cid in enumerate(ranked, start=1):
-        if cid in gold:
-            mrr = 1.0 / i
-            break
-    dcg = sum(r / math.log2(i + 1) for i, r in enumerate(rels, start=1))
+def _metrics(
+    ranked: list[str],
+    gold: set[str],
+    k: int,
+) -> tuple[float, float, float, float]:
+    top = ranked[:k]
+    relevance = [1 if chunk_id in gold else 0 for chunk_id in top]
+    hit = float(any(relevance))
+    mrr = next(
+        (1.0 / rank for rank, chunk_id in enumerate(ranked, start=1) if chunk_id in gold),
+        0.0,
+    )
+    dcg = sum(value / math.log2(index + 1) for index, value in enumerate(relevance, 1))
     ideal = min(len(gold), k)
-    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal + 1)) or 1.0
-    ndcg = dcg / idcg
-    recall = (sum(rels) / len(gold)) if gold else 0.0
-    return hit, mrr, ndcg, recall
+    idcg = sum(1.0 / math.log2(index + 1) for index in range(1, ideal + 1)) or 1.0
+    recall = sum(relevance) / len(gold) if gold else 0.0
+    return hit, mrr, dcg / idcg, recall
+
+
+def evaluate_qasper(
+    dataset: dict,
+    settings: Settings,
+    *,
+    limit: int | None,
+    mode: str,
+    use_reranker: bool,
+    top_k: int | None = None,
+    top_n: int | None = None,
+) -> dict:
+    analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
+    embedder = Embedder(
+        settings.embedding.model_name,
+        settings.embedding.use_sentence_transformers,
+        settings.embedding.fallback_dimension,
+    )
+    reranker = Reranker(
+        settings.rerank.model_name,
+        settings.rerank.use_cross_encoder and use_reranker,
+        analyzer=analyzer,
+    )
+    recall_k = top_k or settings.index.top_k_recall
+    output_k = top_n or settings.index.top_n_rerank
+    values = {"hit": [], "mrr": [], "ndcg": [], "recall": [], "confidence": []}
+    paper_count = 0
+    question_count = 0
+
+    papers = list(dataset.values())
+    if limit:
+        papers = papers[:limit]
+    for paper in papers:
+        chunks = _paragraphs(paper)
+        if len(chunks) < 2:
+            continue
+        paragraph_index = {chunk.content.strip(): chunk.chunk_id for chunk in chunks}
+        vectors = embedder.encode([chunk.content for chunk in chunks])
+        paper_count += 1
+        for question in paper.get("qas", []):
+            gold_text = _gold_evidence(question)
+            gold_ids = {
+                paragraph_index[text] for text in gold_text if text in paragraph_index
+            }
+            if not gold_ids:
+                continue
+            query = question["question"]
+            query_vector = embedder.encode([query])[0]
+            results = rank_in_memory(
+                query,
+                chunks,
+                vectors,
+                query_vector,
+                analyzer=analyzer,
+                reranker=reranker,
+                top_k=recall_k,
+                top_n=output_k,
+                mode=mode,
+                use_reranker=use_reranker,
+                rrf_k=settings.index.rrf_k,
+                max_chunks_per_parent=settings.index.max_chunks_per_parent,
+            )
+            ranked = [result.chunk.chunk_id for result in results]
+            hit, mrr, ndcg, recall = _metrics(ranked, gold_ids, output_k)
+            values["hit"].append(hit)
+            values["mrr"].append(mrr)
+            values["ndcg"].append(ndcg)
+            values["recall"].append(recall)
+            values["confidence"].append(results[0].confidence if results else 0.0)
+            question_count += 1
+    if not question_count:
+        raise ValueError("没有可评估的问题")
+    return {
+        "papers": paper_count,
+        "questions": question_count,
+        "mode": mode,
+        "reranker": use_reranker,
+        "reranker_backend": reranker.backend,
+        "embedding": embedder.signature,
+        "top_k_recall": recall_k,
+        "top_n_rerank": output_k,
+        f"hit@{output_k}": sum(values["hit"]) / question_count,
+        "mrr": sum(values["mrr"]) / question_count,
+        f"ndcg@{output_k}": sum(values["ndcg"]) / question_count,
+        f"recall@{output_k}": sum(values["recall"]) / question_count,
+        "mean_top_confidence": sum(values["confidence"]) / question_count,
+    }
+
+
+def result_metadata(settings: Settings, data_path: Path) -> dict:
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=PROJECT_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        commit = "unknown"
+        dirty = True
+    settings_snapshot = asdict(settings)
+    if settings_snapshot.get("llm", {}).get("openai_api_key"):
+        settings_snapshot["llm"]["openai_api_key"] = "***redacted***"
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "commit": commit or "unknown",
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "working_tree_dirty": dirty,
+        "dataset": str(data_path),
+        "settings": settings_snapshot,
+    }
+
+
+def save_report(report: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".csv":
+        flat = {
+            key: json.dumps(value, ensure_ascii=False)
+            if isinstance(value, (dict, list))
+            else value
+            for key, value in report.items()
+        }
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(flat))
+            writer.writeheader()
+            writer.writerow(flat)
+    else:
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="QASPER 检索侧评估")
-    parser.add_argument("data", nargs="?", default=str(DEFAULT_DATA), help="QASPER JSON 路径")
-    parser.add_argument("--limit", type=int, default=50, help="评估论文数上限（默认 50，加速）")
-    parser.add_argument("--no-rerank", action="store_true", help="禁用 CrossEncoder 重排")
-    parser.add_argument("--sweep", action="store_true",
-                        help="额外扫描 low_confidence_threshold（以 Hit@k 为标签找最优强阈值）")
+    parser = argparse.ArgumentParser(description="QASPER 离线检索评估")
+    parser.add_argument("data", nargs="?", default=str(DEFAULT_DATA))
+    parser.add_argument("--limit", type=int, default=50, help="论文数上限；0 表示全部")
+    parser.add_argument(
+        "--mode",
+        choices=("dense", "sparse", "hybrid"),
+        default="hybrid",
+    )
+    parser.add_argument("--no-rerank", action="store_true")
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument("--sweep", action="store_true", help="保留兼容；输出平均 top confidence")
+    parser.add_argument("--output", type=Path, default=None, help="保存 JSON 或 CSV")
     args = parser.parse_args()
 
     data_path = Path(args.data)
     if not data_path.exists():
         print(f"[QASPER] 未找到数据文件：{data_path}")
-        print("请从 https://allenai.org/data/qasper 下载（建议 dev 集），")
-        print(f"把 qasper-dev-v0.3.json 放到：{DEFAULT_DATA.parent}/")
         sys.exit(1)
-
     settings = load_settings()
-    embedder = Embedder(
-        settings.embedding.model_name, settings.embedding.use_sentence_transformers
-    )
-    use_ce = settings.rerank.use_cross_encoder and not args.no_rerank
-    reranker = Reranker(settings.rerank.model_name, use_cross_encoder=use_ce)
-    try:
-        from rank_bm25 import BM25Okapi
-    except ImportError:
-        BM25Okapi = None
-
     dataset = json.loads(data_path.read_text(encoding="utf-8"))
-    k = settings.index.top_n_rerank
-
-    hits, mrrs, ndcgs, recalls = [], [], [], []
-    sweep_confs, sweep_labels = [], []  # (top 相关概率, 是否 Hit@k)，供阈值扫描
-    n_papers = n_questions = 0
-
-    for paper in list(dataset.values())[: args.limit]:
-        chunks = _paragraphs(paper)
-        if len(chunks) < 2:
-            continue
-        para_index = {c.content.strip(): c.chunk_id for c in chunks}
-        vecs = embedder.encode([c.content for c in chunks])
-        bm25 = BM25Okapi([c.content.lower().split() for c in chunks]) if BM25Okapi else None
-        n_papers += 1
-
-        for qa in paper.get("qas", []):
-            gold_text = _gold_evidence(qa)
-            gold_ids = {para_index[t] for t in gold_text if t in para_index}
-            if not gold_ids:  # 跳过 unanswerable / 仅图表 / evidence 非逐字段落
-                continue
-            pairs = _retrieve(
-                qa["question"], chunks, vecs, bm25, embedder, reranker, settings
-            )
-            ranked = [cid for cid, _ in pairs]
-            hit, mrr, ndcg, recall = _metrics(ranked, gold_ids, k)
-            hits.append(hit); mrrs.append(mrr); ndcgs.append(ndcg); recalls.append(recall)
-            if args.sweep:
-                sweep_confs.append(_sigmoid(pairs[0][1]) if pairs else 0.0)
-                sweep_labels.append(int(hit))
-            n_questions += 1
-
-    if not n_questions:
-        print("[QASPER] 没有可评估的问题（可能数据为空或 evidence 均为图表）。")
+    try:
+        metrics = evaluate_qasper(
+            dataset,
+            settings,
+            limit=args.limit or None,
+            mode=args.mode,
+            use_reranker=not args.no_rerank,
+            top_k=args.top_k,
+            top_n=args.top_n,
+        )
+    except ValueError as exc:
+        print(f"[QASPER] {exc}")
         sys.exit(1)
+    report = {"metadata": result_metadata(settings, data_path), "metrics": metrics}
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    if args.output:
+        save_report(report, args.output)
+        print(f"[QASPER] saved: {args.output}")
 
-    print("===== QASPER 检索评估 =====")
-    print(f"papers: {n_papers}  questions: {n_questions}  "
-          f"rerank(CE): {use_ce}  bm25: {bm25 is not None}")
-    print(f"Hit@{k}:    {sum(hits) / n_questions:.4f}")
-    print(f"MRR:       {sum(mrrs) / n_questions:.4f}")
-    print(f"nDCG@{k}:   {sum(ndcgs) / n_questions:.4f}")
-    print(f"Recall@{k}: {sum(recalls) / n_questions:.4f}")
-
-    if args.sweep:
-        _sweep_report(sweep_confs, sweep_labels)
 
 if __name__ == "__main__":
     main()

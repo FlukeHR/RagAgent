@@ -5,61 +5,16 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
-BBox = tuple[float, float, float, float]
-
-
-@dataclass
-class ParsedBlock:
-    page_number: int
-    text: str
-    bbox: BBox | None = None
-
-
-@dataclass
-class ParsedPage:
-    page_number: int
-    text: str
-    is_scanned_like: bool = False
-    ocr_text: str | None = None
-    vlm_summary: str | None = None
-    blocks: list[ParsedBlock] = field(default_factory=list)
-
-
-@dataclass
-class ParsedElement:
-    element_id: str
-    element_type: str
-    page_start: int
-    page_end: int
-    text: str
-    modality: str = "text"
-    bbox: BBox | None = None
-    caption: str | None = None
-    summary: str | None = None
-    source: str = "sidecar"
-
-    @property
-    def content(self) -> str:
-        parts = []
-        if self.caption:
-            parts.append(f"Caption: {self.caption.strip()}")
-        if self.summary:
-            parts.append(f"Summary: {self.summary.strip()}")
-        if self.text:
-            parts.append(self.text.strip())
-        return "\n".join(p for p in parts if p)
-
-
-@dataclass
-class ParsedPDF:
-    pages: list[ParsedPage]
-    elements: list[ParsedElement] = field(default_factory=list)
-    trace: list[dict] = field(default_factory=list)
+from retrieval.models import (
+    BBox,
+    PaperElement as ParsedElement,
+    PaperPage as ParsedPage,
+    ParsedPDF,
+    TextBlock as ParsedBlock,
+)
 
 
 class PDFParseProvider:
@@ -284,6 +239,8 @@ def _parse_element_json(path: Path, default_type: str | None) -> list[ParsedElem
 def _element_from_item(item: dict, default_type: str | None, fallback_id: str, source: str) -> ParsedElement | None:
     page = item.get("page") or item.get("page_number") or item.get("page_start")
     page_end = item.get("page_end") or page
+    if page is None or page_end is None:
+        return None
     try:
         page_start_i = int(page)
         page_end_i = int(page_end)

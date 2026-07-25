@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 class Turn(BaseModel):
     """对话历史中的一轮（仅纯文本，不含工具内部块）。"""
 
-    role: str = Field(..., description="user | assistant")
+    role: Literal["user", "assistant"]
     content: str = Field(..., description="该轮文本内容")
 
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="用户问题")
+    session_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     history: list[Turn] = Field(
         default_factory=list, description="本会话之前的对话轮次，用于历史注入与指代消解"
     )
@@ -32,23 +39,32 @@ class SourceItem(BaseModel):
     chunk_context: str | None = None
     heading_path: str | None = None
     score: float | None = None
+    confidence: float | None = None
+    score_backend: str | None = None
+    dense_score: float | None = None
+    sparse_score: float | None = None
+    fusion_score: float | None = None
     snippet: str | None = None  # 引用原文片段，供回答展示与生成侧评估使用
     image_mime_type: str | None = None
     image_width: int | None = None
     image_height: int | None = None
     image_base64: str | None = None
+    published_at: str | None = None
+    support_status: str | None = None
+    quality_rank: int = 0
 
 
 class AskResponse(BaseModel):
     answer: str
+    status: str = "answered"
     steps: list[str]
     sources: list[SourceItem]
-    trace: list[dict] = []  # 结构化可观测事件（LLM 轮次/工具调用/核查/预算）
+    trace: list[dict] = Field(default_factory=list)
 
 
 class IngestArxivRequest(BaseModel):
     query: str = Field(..., min_length=1, description="arXiv 检索关键词")
-    max_results: int | None = Field(None, description="下载论文数量")
+    max_results: int | None = Field(None, ge=1, le=20, description="下载论文数量")
 
 
 class IngestArxivResponse(BaseModel):
@@ -62,3 +78,9 @@ class TitleRequest(BaseModel):
 
 class TitleResponse(BaseModel):
     title: str
+
+
+class ConversationResponse(BaseModel):
+    session_id: str
+    state: dict
+    history: list[Turn]

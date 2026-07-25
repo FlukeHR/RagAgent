@@ -9,10 +9,11 @@ arxiv
 pymupdf
 requests
 openai
-faiss-cpu
 rank_bm25
 jsonschema
-ruff
-langchain-openai
 ragas
+langchain-openai
 langchain-huggingface
+faiss-cpu
+ruff
+mypy
