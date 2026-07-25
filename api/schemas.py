@@ -12,7 +12,6 @@ class Turn(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="用户问题")
-    collection: str | None = Field(None, description="目标论文集合名称")
     history: list[Turn] = Field(
         default_factory=list, description="本会话之前的对话轮次，用于历史注入与指代消解"
     )
@@ -33,8 +32,7 @@ class SourceItem(BaseModel):
     chunk_context: str | None = None
     heading_path: str | None = None
     score: float | None = None
-    snippet: str | None = None  # 引用原文片段，前端预览时用于在 PDF 中定位高亮
-    collection: str | None = None  # 该来源 PDF 所在集合目录（arXiv 下载的指向 arxiv），供前端预览定位
+    snippet: str | None = None  # 引用原文片段，供回答展示与生成侧评估使用
     image_mime_type: str | None = None
     image_width: int | None = None
     image_height: int | None = None
@@ -42,25 +40,18 @@ class SourceItem(BaseModel):
 
 
 class AskResponse(BaseModel):
-    collection: str
     answer: str
     steps: list[str]
     sources: list[SourceItem]
     trace: list[dict] = []  # 结构化可观测事件（LLM 轮次/工具调用/核查/预算）
 
 
-class CollectionsResponse(BaseModel):
-    collections: list[str]
-
-
 class IngestArxivRequest(BaseModel):
     query: str = Field(..., min_length=1, description="arXiv 检索关键词")
-    collection: str | None = Field(None, description="下载入库的集合名，默认 arxiv")
     max_results: int | None = Field(None, description="下载论文数量")
 
 
 class IngestArxivResponse(BaseModel):
-    collection: str
     downloaded: list[str]
     indexed_chunks: int
 

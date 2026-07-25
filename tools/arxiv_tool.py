@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from config.settings import BASE_DIR, Settings
+from config.settings import Settings
 from tools.base import ToolResult
 
 
 class ArxivTool:
-    """arXiv 在线检索工具，可选下载 PDF 入库。"""
+    """arXiv 在线摘要检索工具，不负责下载或入库。"""
 
     name = "search_arxiv"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.download_dir = BASE_DIR / settings.arxiv.download_dir
         self.max_results = settings.arxiv.max_results
 
     @staticmethod
@@ -21,7 +20,7 @@ class ArxivTool:
             "description": (
                 "在线检索 arXiv 最新论文，返回标题、作者、发表日期、摘要与链接。"
                 "当本地论文库不足以回答、或用户询问最新研究进展时使用。"
-                "可设 download=true 把 PDF 下载到本地以便后续精读。"
+                "本工具只侦察摘要；需要全文时再调用 ingest_arxiv_papers。"
             ),
             "input_schema": {
                 "type": "object",
@@ -30,10 +29,6 @@ class ArxivTool:
                     "max_results": {
                         "type": "integer",
                         "description": "返回论文数量，省略则用默认配置",
-                    },
-                    "download": {
-                        "type": "boolean",
-                        "description": "是否下载 PDF 到本地，默认 false",
                     },
                 },
                 "required": ["query"],
@@ -44,7 +39,6 @@ class ArxivTool:
         self,
         query: str,
         max_results: int | None = None,
-        download: bool = False,
         _id_base: int = 0,
     ) -> ToolResult:
         import arxiv
@@ -69,16 +63,6 @@ class ArxivTool:
                 f"arxiv_id: {aid}  链接: {result.entry_id}\n"
                 f"摘要: {summary}"
             )
-            downloaded_ok = False
-            if download:
-                self.download_dir.mkdir(parents=True, exist_ok=True)
-                target = self.download_dir / f"{aid}.pdf"
-                try:
-                    self._download_pdf(result, target)
-                    block += f"\n（已下载到 {target}）"
-                    downloaded_ok = True
-                except Exception as exc:  # noqa: BLE001 - 网络/IO 失败不应中断检索
-                    block += f"\n（下载失败: {exc}）"
             blocks.append(block)
             src = {
                 "id": sid,
@@ -95,25 +79,8 @@ class ArxivTool:
                 "score": None,
                 "snippet": summary[:600],
             }
-            if downloaded_ok:
-                # 已落地本地 PDF：标记为可预览，并指向下载所在集合（默认 arxiv），
-                # 使前端点击图标能像 demo 的 PDF 一样打开并按摘要定位高亮。
-                src["source"] = f"{aid}.pdf"
-                src["collection"] = self.download_dir.name
             sources.append(src)
 
         if not blocks:
             return ToolResult(text=f"arXiv 未检索到与 '{query}' 相关的论文。", sources=[])
         return ToolResult(text="\n\n".join(blocks), sources=sources)
-
-    @staticmethod
-    def _download_pdf(result, path) -> None:
-        """arxiv 4.x 移除了内置下载，这里用 requests 直接拉取 PDF。"""
-        import requests
-
-        url = getattr(result, "pdf_url", None) or result.entry_id.replace(
-            "/abs/", "/pdf/"
-        )
-        resp = requests.get(url, timeout=60, headers={"User-Agent": "paper-rag-agent"})
-        resp.raise_for_status()
-        path.write_bytes(resp.content)

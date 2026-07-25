@@ -104,15 +104,15 @@ def plan_incremental(
     return kept_chunks, kept_vectors, build_sources, removed
 
 
-def build_collection(
-    settings: Settings, collection: str, incremental: bool = True, verbose: bool = False
+def build_index(
+    settings: Settings, incremental: bool = True, verbose: bool = False
 ) -> int:
-    """为指定论文集合构建索引（默认增量），返回 chunk 数量。
+    """为统一论文库构建索引（默认增量），返回 chunk 数量。
 
     增量：只对新增/改动的文件重新嵌入，复用未变文件的向量；切块/嵌入参数变化时自动全量重建。
     """
-    data_dir = BASE_DIR / settings.project.data_root / collection
-    index_dir = BASE_DIR / settings.index.index_root / collection
+    data_dir = BASE_DIR / settings.project.data_root
+    index_dir = BASE_DIR / settings.index.index_root
 
     pdf_provider = provider_from_config(
         settings.pdf_parse.provider,
@@ -160,7 +160,7 @@ def build_collection(
 
     all_chunks = kept_chunks + new_chunks
     if not all_chunks:
-        raise ValueError(f"集合 '{collection}' 下未找到可索引的论文：{data_dir}")
+        raise ValueError(f"未找到可索引的论文：{data_dir}")
 
     if new_chunks:
         embedder = Embedder(
@@ -188,16 +188,14 @@ def build_collection(
 
 def main() -> None:
     settings = load_settings()
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
     full = "--full" in sys.argv[1:]
-    collection = args[0] if args else settings.project.default_collection
 
-    data_dir = BASE_DIR / settings.project.data_root / collection
-    index_dir = BASE_DIR / settings.index.index_root / collection
-    print(f"[Index] collection = {collection}（{'全量' if full else '增量'}）")
+    data_dir = BASE_DIR / settings.project.data_root
+    index_dir = BASE_DIR / settings.index.index_root
+    print(f"[Index] mode = {'全量' if full else '增量'}")
     print(f"[Index] loading papers from: {data_dir}")
 
-    n = build_collection(settings, collection, incremental=not full, verbose=True)
+    n = build_index(settings, incremental=not full, verbose=True)
     print(f"[Index] 索引共 {n} chunks")
     print(f"[Index] saved index to: {index_dir}")
 

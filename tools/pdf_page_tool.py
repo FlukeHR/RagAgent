@@ -13,8 +13,8 @@ class PDFPageTool:
 
     name = "read_pdf_page"
 
-    def __init__(self, settings: Settings, collection: str) -> None:
-        self.collection_dir = BASE_DIR / settings.project.data_root / collection
+    def __init__(self, settings: Settings) -> None:
+        self.data_dir = BASE_DIR / settings.project.data_root
 
     @staticmethod
     def schema() -> dict:
@@ -140,5 +140,5 @@ class PDFPageTool:
         return ToolResult(text=result_text, sources=[source])
 
     def _pdf_path(self, paper_id: str) -> Path | None:
-        candidate = self.collection_dir / f"{paper_id}.pdf"
+        candidate = self.data_dir / f"{paper_id}.pdf"
         return candidate if candidate.exists() else None

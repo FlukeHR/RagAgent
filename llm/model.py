@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from config.settings import LLMConfig
@@ -20,12 +19,12 @@ class ToolCall:
 
 @dataclass
 class LLMTurn:
-    """一次模型回复的 provider 无关表示。"""
+    """一次 OpenAI-compatible 模型回复。"""
 
     text: str
     tool_calls: list[ToolCall]
     stop: bool
-    raw: Any = None  # provider 原生 assistant 表示，用于回填历史
+    raw: Any = None  # OpenAI assistant message，用于回填历史
     usage: dict = field(default_factory=dict)  # {input_tokens, output_tokens}，供预算核算
 
 
@@ -37,40 +36,16 @@ class ToolOutcome:
 
 
 class LLMClient:
-    """统一 LLM 封装，支持两类 agentic 后端：
+    """OpenAI-compatible LLM 封装。
 
-    - Anthropic：Claude 原生 tool use。
-    - OpenAI 兼容：OpenAI function calling（DeepSeek / Qwen / Ollama / vLLM 等）。
-
-    两者通过 init_history / create_turn / append_* 这组 provider 无关的原语被
-    agent 的同一个循环驱动。无可用后端时降级为纯文本生成。
+    支持 OpenAI function calling，以及 DeepSeek、Qwen、Ollama、vLLM 等兼容接口。
+    未配置接口或调用失败时降级为本地检索摘要。
     """
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
-        self._anthropic = None
-
-    @property
-    def provider(self) -> str:
-        return self.config.provider.lower()
 
     # ---------- 可用性 ----------
-    def anthropic_available(self) -> bool:
-        if self.provider != "anthropic":
-            return False
-        try:
-            import anthropic  # noqa: F401
-        except ImportError:
-            return False
-        # 支持三种凭据：API key / OAuth AUTH_TOKEN / `ant auth login` 写入的 profile
-        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
-            return True
-        config_dir = os.getenv("ANTHROPIC_CONFIG_DIR") or os.path.expanduser(
-            "~/.config/anthropic"
-        )
-        creds = Path(config_dir) / "credentials"
-        return creds.is_dir() and any(creds.glob("*.json"))
-
     def _openai_configured(self) -> bool:
         return bool(
             self.config.openai_api_base
@@ -80,18 +55,16 @@ class LLMClient:
 
     def supports_agentic(self) -> bool:
         """是否能走带工具调用的 agentic 循环。"""
-        if self.anthropic_available():
-            return True
-        return self.provider == "openai" and self._openai_configured()
+        return self._openai_configured()
 
-    # ---------- 统一 agentic 原语 ----------
+    # ---------- agentic 原语 ----------
     def init_history(
         self, question: str, prior: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
         """构造工作历史：把之前的对话轮次（纯文本）注入到当前问题前面。
 
-        prior 中每项为 {"role": "user"|"assistant", "content": str}；两类 provider
-        都接受字符串 content，故可直接复用。非法 role / 空内容会被跳过。
+        prior 中每项为 {"role": "user"|"assistant", "content": str}。
+        非法 role / 空内容会被跳过。
         """
         msgs: list[dict[str, Any]] = []
         for t in prior or []:
@@ -105,85 +78,22 @@ class LLMClient:
     def create_turn(
         self, system: str, history: list[dict], tools: list[dict]
     ) -> LLMTurn:
-        if self.provider == "openai":
-            return self._openai_turn(system, history, tools)
-        return self._anthropic_turn(system, history, tools)
+        return self._openai_turn(system, history, tools)
 
     def append_assistant(self, history: list[dict], turn: LLMTurn) -> None:
-        if self.provider == "openai":
-            history.append(turn.raw)
-        else:
-            history.append({"role": "assistant", "content": turn.raw})
+        history.append(turn.raw)
 
     def append_tool_results(
         self, history: list[dict], outcomes: list[ToolOutcome]
     ) -> None:
-        if self.provider == "openai":
-            for o in outcomes:
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": o.tool_call.id,
-                        "content": o.content,
-                    }
-                )
-        else:
-            blocks = []
-            for o in outcomes:
-                block = {
-                    "type": "tool_result",
-                    "tool_use_id": o.tool_call.id,
+        for o in outcomes:
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": o.tool_call.id,
                     "content": o.content,
                 }
-                if o.is_error:
-                    block["is_error"] = True
-                blocks.append(block)
-            history.append({"role": "user", "content": blocks})
-
-    # ---------- Anthropic 实现 ----------
-    def _client(self):
-        import anthropic
-
-        if self._anthropic is None:
-            self._anthropic = anthropic.Anthropic(timeout=120.0)
-        return self._anthropic
-
-    def _anthropic_turn(
-        self, system: str, history: list[dict], tools: list[dict]
-    ) -> LLMTurn:
-        client = self._client()
-        kwargs: dict[str, Any] = dict(
-            model=self.config.model_name,
-            max_tokens=self.config.max_tokens,
-            system=system,
-            messages=history,
-            tools=tools,
-            thinking={"type": "adaptive"},
-        )
-        try:
-            resp = client.messages.create(
-                extra_body={"output_config": {"effort": self.config.effort}}, **kwargs
             )
-        except TypeError:
-            resp = client.messages.create(**kwargs)
-
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        tool_calls = [
-            ToolCall(id=b.id, name=b.name, input=dict(b.input))
-            for b in resp.content
-            if b.type == "tool_use"
-        ]
-        usage = getattr(resp, "usage", None)
-        return LLMTurn(
-            text=text,
-            tool_calls=tool_calls,
-            stop=resp.stop_reason != "tool_use",
-            raw=resp.content,
-            usage={
-                "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
-                "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
-            },
-        )
 
     # ---------- OpenAI 兼容实现 ----------
     def _openai_client(self):
@@ -261,23 +171,11 @@ class LLMClient:
     # ---------- 降级：纯文本生成 ----------
     def generate(self, prompt: str, system: str = DEFAULT_SYSTEM) -> str:
         try:
-            if self.provider == "anthropic" and self.anthropic_available():
-                return self._generate_anthropic(prompt, system)
-            if self.provider == "openai":
+            if self._openai_configured():
                 return self._generate_openai(prompt, system)
         except Exception as exc:  # noqa: BLE001 - 调用失败兜底为本地检索摘要
             return f"【大模型调用失败，降级为本地检索摘要：{exc}】\n\n" + self._generate_local(prompt)
         return self._generate_local(prompt)
-
-    def _generate_anthropic(self, prompt: str, system: str) -> str:
-        client = self._client()
-        resp = client.messages.create(
-            model=self.config.model_name,
-            max_tokens=self.config.max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(b.text for b in resp.content if b.type == "text")
 
     def _generate_openai(self, prompt: str, system: str) -> str:
         client = self._openai_client()
@@ -310,7 +208,7 @@ class LLMClient:
         if contexts:
             out.extend(f"- {c}" for c in contexts[:5])
             out.append("")
-            out.append("如需高质量的综合回答与引用整合，请配置大模型后端（Anthropic 或 OpenAI 兼容）。")
+            out.append("如需高质量的综合回答与引用整合，请配置 OpenAI-compatible API。")
         else:
             out.append("- 未检索到相关论文片段。")
         return "\n".join(out)

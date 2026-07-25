@@ -12,9 +12,9 @@ class PaperReaderTool:
 
     name = "read_paper_section"
 
-    def __init__(self, settings: Settings, collection: str, max_chars: int = 4000) -> None:
-        self.collection_dir = BASE_DIR / settings.project.data_root / collection
-        self.loader = PaperLoader(str(self.collection_dir))
+    def __init__(self, settings: Settings, max_chars: int = 4000) -> None:
+        self.data_dir = BASE_DIR / settings.project.data_root
+        self.loader = PaperLoader(str(self.data_dir))
         self.max_chars = max_chars
 
     @staticmethod
@@ -81,7 +81,7 @@ class PaperReaderTool:
 
     def _load(self, paper_id: str) -> PaperDocument | None:
         for suffix in (".pdf", ".txt", ".md"):
-            f = self.collection_dir / f"{paper_id}{suffix}"
+            f = self.data_dir / f"{paper_id}{suffix}"
             if f.exists():
                 return self.loader.load_file(Path(f))
         return None

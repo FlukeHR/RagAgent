@@ -10,8 +10,8 @@ class PaperSearchTool:
 
     name = "search_local_papers"
 
-    def __init__(self, settings: Settings, collection: str) -> None:
-        index_dir = BASE_DIR / settings.index.index_root / collection
+    def __init__(self, settings: Settings) -> None:
+        index_dir = BASE_DIR / settings.index.index_root
         self.retriever = Retriever(settings=settings, index_dir=str(index_dir))
 
     @staticmethod
@@ -70,7 +70,7 @@ class PaperSearchTool:
                     "chunk_context": c.chunk_context,
                     "heading_path": c.heading_path,
                     "score": round(float(r.score), 4),
-                    "snippet": c.content[:600],  # 供 /preview 在 PDF 中精确定位高亮
+                    "snippet": c.content[:600],
                 }
             )
         return ToolResult(text="\n\n".join(blocks), sources=sources)

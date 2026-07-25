@@ -1,20 +1,13 @@
 """生成侧评估（RAGAS）：faithfulness / answer relevancy / context precision。
 
-**会调用真实 LLM API（计费）**，与单测隔离，需显式授权后才运行——不违反「单测不真打 API」红线。
-judge LLM 复用项目的 LLM 配置（DeepSeek/OpenAI 兼容 或 Anthropic）；嵌入用本地模型避免嵌入 API。
+**会调用真实 LLM API（计费）**，需显式授权后才运行。
+judge LLM 复用项目的 OpenAI-compatible 配置；嵌入用本地模型避免嵌入 API。
 
 依赖（可选，仅本脚本需要）：
     pip install ragas langchain-openai langchain-huggingface
-    # Anthropic 后端再加： pip install langchain-anthropic
-
-两种评测集：
-  1) 官方 QASPER（推荐）：单文档 QA，在每题所属论文内检索→生成，以 gold answer 为 reference，
-     可跑有参考指标（context precision/recall、answer correctness）。
-  2) 自定义集 JSON：[{"question": ..., "collection": "demo"?, "reference": ...?}, ...]，走真实 agent 生成。
 
 跑法：
-    RAG_EVAL_ALLOW_API=1 python3 evaluation/eval_generation.py --qasper --limit 20 --record   # 官方 QASPER
-    RAG_EVAL_ALLOW_API=1 python3 evaluation/eval_generation.py path/to/set.json                # 自定义集
+    RAG_EVAL_ALLOW_API=1 python3 evaluation/eval_generation.py --limit 20
     # --yes 可代替 RAG_EVAL_ALLOW_API=1
 """
 from __future__ import annotations
@@ -31,7 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import load_settings, resolve_model_path
 
-DEFAULT_DATA = PROJECT_ROOT / "evaluation" / "data" / "generation_eval.json"
 DEFAULT_QASPER = PROJECT_ROOT / "evaluation" / "data" / "qasper" / "qasper-dev-v0.3.json"
 
 
@@ -39,7 +31,7 @@ def _patch_langchain_community() -> None:
     """兼容垫片：ragas 0.4.x 的 llms/base.py 仍硬 import
     `langchain_community.chat_models.vertexai.ChatVertexAI`，而 langchain-community 1.x
     已把 vertexai 移出该路径，导致 `import ragas` 直接失败。这里在导入 ragas 前注入一个
-    占位模块（我们用 DeepSeek/OpenAI 兼容或 Anthropic，根本不碰 vertexai）。
+    占位模块（项目使用 OpenAI-compatible API，不使用 vertexai）。
     若该模块真实存在则不动。彻底方案是对齐 ragas 与 langchain 版本，此处优先保证可跑通。
     """
     import importlib
@@ -55,38 +47,10 @@ def _patch_langchain_community() -> None:
     mod.ChatVertexAI = type("ChatVertexAI", (), {})  # 仅占位，不会被实际调用
     sys.modules[name] = mod
 
-SAMPLE_FORMAT = """[
-  {"question": "Transformer 为什么用自注意力替代循环结构？", "collection": "demo"},
-  {"question": "BERT 的预训练目标是什么？", "collection": "demo", "reference": "MLM 与 NSP"}
-]"""
 
-
-# ---------- 可离线测试的纯逻辑 ----------
 def authorized(yes_flag: bool) -> bool:
     """是否已显式授权调用真实 API。"""
     return bool(yes_flag) or os.getenv("RAG_EVAL_ALLOW_API") == "1"
-
-
-def collect_samples(items, get_agent, default_collection: str, limit: int | None = None) -> list[dict]:
-    """对每个问题跑真实检索+生成，组装成 ragas 需要的样本（user_input/response/retrieved_contexts[/reference]）。
-
-    get_agent(collection) -> 具备 .ask(question) -> (answer, sources) 的对象（生产用 PaperRAGAgent）。
-    """
-    samples: list[dict] = []
-    for it in (items[:limit] if limit else items):
-        coll = it.get("collection") or default_collection
-        res = get_agent(coll).ask(it["question"])
-        contexts = [s.get("snippet") or s.get("content") or "" for s in res.sources]
-        contexts = [c for c in contexts if c] or ["(无检索内容)"]
-        sample = {
-            "user_input": it["question"],
-            "response": res.answer,
-            "retrieved_contexts": contexts,
-        }
-        if it.get("reference"):
-            sample["reference"] = it["reference"]
-        samples.append(sample)
-    return samples
 
 
 # ---------- 官方 QASPER 生成侧（单文档 QA：在该论文内检索→生成→以 gold answer 为 reference） ----------
@@ -179,20 +143,13 @@ def _build_judge(settings):
     from ragas.llms import LangchainLLMWrapper
 
     cfg = settings.llm
-    if cfg.provider == "openai":
-        from langchain_openai import ChatOpenAI
+    from langchain_openai import ChatOpenAI
 
-        llm = ChatOpenAI(
-            model=cfg.model_name,
-            base_url=cfg.openai_api_base or None,
-            api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
-        )
-    elif cfg.provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-
-        llm = ChatAnthropic(model=cfg.model_name)
-    else:
-        raise SystemExit(f"生成侧评估不支持 provider={cfg.provider}（需 openai 兼容或 anthropic）")
+    llm = ChatOpenAI(
+        model=cfg.model_name,
+        base_url=cfg.openai_api_base or None,
+        api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
+    )
 
     from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -236,13 +193,14 @@ def _metrics(with_reference: bool = False):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成侧评估（RAGAS），会调用真实 LLM API")
-    parser.add_argument("data", nargs="?", default=str(DEFAULT_DATA), help="自定义评估集 JSON 路径")
-    parser.add_argument("--qasper", nargs="?", const=str(DEFAULT_QASPER), default=None,
-                        help="用官方 QASPER 做生成侧评测（单文档 QA，带 gold answer 参考）；可附路径")
+    parser.add_argument(
+        "qasper",
+        nargs="?",
+        default=str(DEFAULT_QASPER),
+        help="QASPER JSON 路径",
+    )
     parser.add_argument("--limit", type=int, default=None, help="评估问题数上限")
-    parser.add_argument("--collection", default=None, help="自定义集合（非 QASPER 模式，数据项未指定时用）")
     parser.add_argument("--yes", action="store_true", help="确认调用真实 API（等价 RAG_EVAL_ALLOW_API=1）")
-    parser.add_argument("--record", action="store_true", help="把本次指标追加到评估历史记录")
     args = parser.parse_args()
 
     if not authorized(args.yes):
@@ -258,39 +216,22 @@ def main() -> None:
 
     settings = load_settings()
 
-    if args.qasper:  # 官方 QASPER 模式（推荐）：单文档检索→生成，带 reference 跑有参考指标
-        qpath = Path(args.qasper)
-        if not qpath.exists():
-            print(f"未找到 QASPER 数据：{qpath}\n请从 https://allenai.org/data/qasper 下载放到该路径。")
-            sys.exit(1)
-        from llm.model import LLMClient
-
-        print(f"[GenEval] QASPER 模式，收集样本（provider={settings.llm.provider}）…")
-        samples = collect_samples_qasper(
-            json.loads(qpath.read_text(encoding="utf-8")), settings, LLMClient(settings.llm), args.limit
+    qpath = Path(args.qasper)
+    if not qpath.exists():
+        print(
+            f"未找到 QASPER 数据：{qpath}\n"
+            "请从 https://allenai.org/data/qasper 下载放到该路径。"
         )
-        dataset_name, with_reference = qpath.name, True
-    else:  # 自定义评估集
-        data_path = Path(args.data)
-        if not data_path.exists():
-            print(f"未找到评估集：{data_path}\n用官方 QASPER 跑：--qasper；或自建该文件，格式：\n{SAMPLE_FORMAT}")
-            sys.exit(1)
-        items = json.loads(data_path.read_text(encoding="utf-8"))
-        if not items:
-            print("评估集为空。")
-            sys.exit(1)
-        from agent.graph import PaperRAGAgent
+        sys.exit(1)
+    from llm.model import LLMClient
 
-        agents: dict[str, PaperRAGAgent] = {}
-
-        def get_agent(coll: str) -> PaperRAGAgent:
-            return agents.setdefault(coll, PaperRAGAgent(settings, coll))
-
-        default_coll = args.collection or settings.project.default_collection
-        print(f"[GenEval] 自定义集，收集样本（provider={settings.llm.provider}, 集合={default_coll}）…")
-        samples = collect_samples(items, get_agent, default_coll, args.limit)
-        dataset_name = data_path.name
-        with_reference = bool(samples) and all("reference" in s for s in samples)
+    print("[GenEval] QASPER 模式，收集样本（openai-compatible）…")
+    samples = collect_samples_qasper(
+        json.loads(qpath.read_text(encoding="utf-8")),
+        settings,
+        LLMClient(settings.llm),
+        args.limit,
+    )
 
     if not samples:
         print("没有可评估的样本（QASPER 全 unanswerable，或评估集为空）。")
@@ -298,33 +239,15 @@ def main() -> None:
 
     judge_llm, judge_emb = _build_judge(settings)
     dataset = EvaluationDataset.from_list(samples)
-    print(f"[GenEval] 评分 {len(samples)} 条样本（有参考={with_reference}）…")
-    result = evaluate(dataset=dataset, metrics=_metrics(with_reference), llm=judge_llm, embeddings=judge_emb)
+    print(f"[GenEval] 评分 {len(samples)} 条样本…")
+    result = evaluate(
+        dataset=dataset,
+        metrics=_metrics(with_reference=True),
+        llm=judge_llm,
+        embeddings=judge_emb,
+    )
     print("\n===== RAGAS 生成侧评估 =====")
     print(result)
-
-    if args.record:
-        from evaluation.results_log import record_run
-
-        metrics = _result_to_dict(result)
-        if metrics:
-            rec = record_run("generation", dataset_name, len(samples), metrics, settings)
-            print(f"\n[已记录] {rec['git']}@{rec['branch']} → evaluation/results/history.jsonl")
-        else:
-            print("[警告] 无法从 ragas 结果解析出指标，未记录。")
-
-
-def _result_to_dict(result) -> dict[str, float]:
-    """把 ragas EvaluationResult 聚合成 {指标: 均值}（跨版本鲁棒）。"""
-    try:
-        df = result.to_pandas()
-        nums = df.select_dtypes("number")
-        return {c: float(nums[c].mean()) for c in nums.columns}
-    except Exception:  # noqa: BLE001 - 退回 dict 化
-        try:
-            return {k: float(v) for k, v in dict(result).items()}
-        except Exception:  # noqa: BLE001
-            return {}
 
 
 if __name__ == "__main__":

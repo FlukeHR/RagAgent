@@ -15,9 +15,9 @@ class ImageSearchTool:
 
     name = "search_pdf_images"
 
-    def __init__(self, settings: Settings, collection: str) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.collection_dir = BASE_DIR / settings.project.data_root / collection
+        self.data_dir = BASE_DIR / settings.project.data_root
 
     @staticmethod
     def schema() -> dict:
@@ -63,7 +63,7 @@ class ImageSearchTool:
 
         candidates: list[tuple[Path, int, bytes, float]] = []
         scanned_pages = 0
-        for pdf in sorted(self.collection_dir.glob("*.pdf")):
+        for pdf in sorted(self.data_dir.glob("*.pdf")):
             pages = PaperLoader._read_pdf_pages(pdf)
             for page in pages:
                 if scanned_pages >= self.settings.image_search.max_pages:
@@ -127,7 +127,7 @@ class ImageSearchTool:
                 return b""
         if not paper_id or not page_number:
             return b""
-        pdf = self.collection_dir / f"{paper_id}.pdf"
+        pdf = self.data_dir / f"{paper_id}.pdf"
         if not pdf.exists():
             return b""
         box = tuple(float(x) for x in bbox) if bbox else None

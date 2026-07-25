@@ -4,36 +4,28 @@ import threading
 from pathlib import Path
 
 from config.settings import BASE_DIR, Settings
-from indexing.build_index import build_collection
-from indexing.prune import prune_collection, touch_papers
+from indexing.build_index import build_index
+from indexing.prune import load_registry, prune_library, touch_papers
 from retrieval.retriever import Retriever
 from tools.base import ToolResult
 
-# 集合级锁：串行化「同一全文集合」的下载 + 增量重建，避免并发 /ask 写索引文件竞争（护栏 #2）。
-_COLLECTION_LOCKS: dict[str, threading.Lock] = {}
-_LOCKS_GUARD = threading.Lock()
-
-
-def _collection_lock(name: str) -> threading.Lock:
-    with _LOCKS_GUARD:
-        return _COLLECTION_LOCKS.setdefault(name, threading.Lock())
+_LIBRARY_LOCK = threading.Lock()
 
 
 class ArxivIngestTool:
     """把模型选定的 arXiv 论文下载入库（增量嵌入）并在其中检索，返回可引用的全文片段。
 
     与 search_arxiv（只回摘要、负责侦察）配合：模型先浏览摘要挑出确需精读的论文，
-    再把它们的 arxiv_id 交给本工具拉全文。下载落到共享全文集合（默认 arxiv），按 hash
-    去重 + 增量索引，只对新论文做嵌入；随后用 query 在该集合检索，输出 [S编号] 来源。
+    再把它们的 arxiv_id 交给本工具拉全文。下载落到统一论文库，按 hash
+    去重 + 增量索引，只对新论文做嵌入；随后用 query 在统一论文库检索，输出 [S编号] 来源。
     """
 
     name = "ingest_arxiv_papers"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.collection = settings.arxiv.full_text_collection
-        self.data_dir = BASE_DIR / settings.project.data_root / self.collection
-        self.index_dir = BASE_DIR / settings.index.index_root / self.collection
+        self.data_dir = BASE_DIR / settings.project.data_root
+        self.index_dir = BASE_DIR / settings.index.index_root
         # 供 harness 按工具覆盖超时：这一步含网络下载 + 嵌入推理，需比默认更长的有界超时。
         self.timeout_seconds = settings.arxiv.ingest_timeout_seconds
 
@@ -85,7 +77,7 @@ class ArxivIngestTool:
         failed: list[str] = []
         skipped: list[str] = []  # 已在库，直接复用
 
-        with _collection_lock(self.collection):
+        with _LIBRARY_LOCK:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             for aid in ids:
                 target = self.data_dir / f"{aid}.pdf"
@@ -100,16 +92,22 @@ class ArxivIngestTool:
             # 有新论文，或索引尚不存在时，触发增量重建（已存在论文会被复用、不重嵌）。
             if downloaded or not (self.index_dir / "vectors.npy").exists():
                 if any(self.data_dir.glob("*.pdf")):
-                    build_collection(self.settings, self.collection, incremental=True)
+                    build_index(self.settings, incremental=True)
 
             results = self._search(query)
 
             # registry：刷新本轮涉及论文的 last_used_at（入库 + 复用 + 检索命中）
-            touched = set(downloaded) | set(skipped) | {r.chunk.paper_id for r in results}
+            registered = set(load_registry(self.data_dir))
+            hit_ids = {result.chunk.paper_id for result in results}
+            touched = (
+                set(downloaded)
+                | set(skipped)
+                | (hit_ids & registered)
+            )
             if touched:
-                touch_papers(self.settings, self.collection, touched)
+                touch_papers(self.settings, touched)
             # 入库后自动按容量 LRU 淘汰，保护本轮用到的论文（无超量时几乎零开销）
-            prune_collection(self.settings, self.collection, protect=touched)
+            prune_library(self.settings, protect=touched)
 
         return self._format(results, downloaded, skipped, failed, _id_base)
 
@@ -140,7 +138,7 @@ class ArxivIngestTool:
             return False
 
     def _search(self, query: str):
-        """在全文集合上做一次检索；索引缺失时返回空。"""
+        """在统一论文库上做一次检索；索引缺失时返回空。"""
         try:
             retriever = Retriever(settings=self.settings, index_dir=str(self.index_dir))
             return retriever.search(query)
@@ -191,7 +189,6 @@ class ArxivIngestTool:
                     "heading_path": c.heading_path,
                     "score": round(float(r.score), 4),
                     "snippet": c.content[:600],
-                    "collection": self.collection,  # 指向 arxiv 全文集合，供前端 PDF 预览定位高亮
                 }
             )
         text = f"[入库情况] {note}。检索到以下全文片段：\n\n" + "\n\n".join(blocks)

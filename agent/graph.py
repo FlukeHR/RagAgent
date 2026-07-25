@@ -33,22 +33,21 @@ def _sigmoid(x: float) -> float:
 class PaperRAGAgent:
     """论文问答 Agent。
 
-    - 后端支持工具调用时（Claude 原生 tool use，或 DeepSeek/Qwen/Ollama 等 OpenAI
-      兼容的 function calling）：走 agentic 循环（多源检索 + 自我纠错 + 引用溯源）。
+    - OpenAI-compatible 后端支持 function calling 时，走 agentic 循环
+      （多源检索 + 自我纠错 + 引用溯源）。
     - 否则：降级为传统单跳 RAG（本地检索 + 拼接生成）。
     """
 
-    def __init__(self, settings: Settings, collection: str) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.collection = collection
         self.llm = LLMClient(settings.llm)
-        self.search_tool = PaperSearchTool(settings, collection)
+        self.search_tool = PaperSearchTool(settings)
         self.arxiv_tool = ArxivTool(settings)
         self.arxiv_ingest_tool = ArxivIngestTool(settings)
-        self.reader_tool = PaperReaderTool(settings, collection)
-        self.pdf_page_tool = PDFPageTool(settings, collection)
-        self.pdf_region_tool = PDFRegionTool(settings, collection)
-        self.image_search_tool = ImageSearchTool(settings, collection)
+        self.reader_tool = PaperReaderTool(settings)
+        self.pdf_page_tool = PDFPageTool(settings)
+        self.pdf_region_tool = PDFRegionTool(settings)
+        self.image_search_tool = ImageSearchTool(settings)
         self._tools = {
             self.search_tool.name: self.search_tool,
             self.arxiv_tool.name: self.arxiv_tool,
@@ -59,9 +58,7 @@ class PaperRAGAgent:
             self.image_search_tool.name: self.image_search_tool,
         }
 
-    def ask(
-        self, question: str, history: list[dict] | None = None
-    ) -> AgentAnswer:
+    def ask(self, question: str, history: list[dict] | None = None) -> AgentAnswer:
         """回答一个问题。history 为本会话之前的对话轮次（{role, content} 纯文本）。
 
         有历史时先做查询改写 / 指代消解，得到独立可检索的问题；两条路径都用它检索，
@@ -105,7 +102,7 @@ class PaperRAGAgent:
             return question
         return out
 
-    # ---------- agentic 主路径（provider 无关） ----------
+    # ---------- agentic 主路径 ----------
     def _tool_schemas(self) -> list[dict]:
         return [
             PaperSearchTool.schema(),
@@ -125,7 +122,7 @@ class PaperRAGAgent:
     ) -> AgentAnswer:
         prior = prior or []
         standalone = standalone or question
-        steps: list[str] = [f"Planner: 启动 agentic 检索循环(provider={self.llm.provider})"]
+        steps: list[str] = ["Planner: 启动 agentic 检索循环(openai-compatible)"]
         sources: list[dict] = []
         trace: list[dict] = []  # 结构化可观测事件（护栏 #6）
         if prior:

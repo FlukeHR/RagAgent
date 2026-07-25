@@ -13,15 +13,15 @@ class PDFRegionTool:
 
     name = "read_pdf_region"
 
-    def __init__(self, settings: Settings, collection: str) -> None:
-        self.collection_dir = BASE_DIR / settings.project.data_root / collection
+    def __init__(self, settings: Settings) -> None:
+        self.data_dir = BASE_DIR / settings.project.data_root
 
     @staticmethod
     def schema() -> dict:
         return {
             "name": "read_pdf_region",
             "description": (
-                "按 bbox 读取/渲染本地 PDF 的页内区域。用于核对表格、图表、公式或 bbox 高亮。"
+                "按 bbox 读取/渲染本地 PDF 的页内区域。用于核对表格、图表、公式或精确定位。"
                 "bbox 为 PDF 坐标 [x0,y0,x1,y1]，一次只读一个小区域。"
             ),
             "input_schema": {
@@ -109,7 +109,7 @@ class PDFRegionTool:
         )
 
     def _pdf_path(self, paper_id: str) -> Path | None:
-        candidate = self.collection_dir / f"{paper_id}.pdf"
+        candidate = self.data_dir / f"{paper_id}.pdf"
         return candidate if candidate.exists() else None
 
     @staticmethod

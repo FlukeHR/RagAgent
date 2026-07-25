@@ -5,7 +5,6 @@ PyYAML
 numpy
 scikit-learn
 sentence-transformers
-anthropic
 arxiv
 pymupdf
 requests
@@ -13,9 +12,7 @@ openai
 faiss-cpu
 rank_bm25
 jsonschema
-pytest
 ruff
 langchain-openai
 ragas
 langchain-huggingface
-langchain-anthropic

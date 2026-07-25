@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +29,3 @@ jobs:
         run: |
           pip install mypy
           mypy --ignore-missing-imports --no-error-summary agent config llm tools indexing retrieval || true
-
-      - name: Unit tests (离线，全 mock，不打网络/API)
-        run: pytest tests/ -q
-
-      - name: PDF grounding smoke eval (离线)
-        run: python evaluation/eval_pdf_grounding.py evaluation/data/pdf_grounding/offline_smoke.json

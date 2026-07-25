@@ -155,7 +155,6 @@ def main() -> None:
     parser.add_argument("--no-rerank", action="store_true", help="禁用 CrossEncoder 重排")
     parser.add_argument("--sweep", action="store_true",
                         help="额外扫描 low_confidence_threshold（以 Hit@k 为标签找最优强阈值）")
-    parser.add_argument("--record", action="store_true", help="把本次指标追加到评估历史记录")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -222,20 +221,6 @@ def main() -> None:
 
     if args.sweep:
         _sweep_report(sweep_confs, sweep_labels)
-
-    if args.record:
-        from evaluation.results_log import record_run
-
-        metrics = {
-            f"hit@{k}": sum(hits) / n_questions,
-            "mrr": sum(mrrs) / n_questions,
-            f"ndcg@{k}": sum(ndcgs) / n_questions,
-            f"recall@{k}": sum(recalls) / n_questions,
-        }
-        rec = record_run("retrieval", data_path.name, n_questions, metrics, settings,
-                         note=f"papers={n_papers} ce={use_ce}")
-        print(f"\n[已记录] {rec['git']}@{rec['branch']} → evaluation/results/history.jsonl")
-
 
 if __name__ == "__main__":
     main()

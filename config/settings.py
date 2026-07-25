@@ -11,7 +11,6 @@ import yaml
 class ProjectConfig:
     name: str
     data_root: str
-    default_collection: str
 
 
 @dataclass
@@ -62,10 +61,8 @@ class ImageSearchConfig:
 
 @dataclass
 class LLMConfig:
-    provider: str
     model_name: str
     max_tokens: int
-    effort: str
     max_tool_iters: int
     openai_api_base: str
     openai_api_key: str
@@ -74,12 +71,10 @@ class LLMConfig:
 @dataclass
 class ArxivConfig:
     max_results: int
-    download_dir: str
-    full_text_collection: str = "arxiv"   # 下载论文入库的共享全文集合（复用 download_dir）
     max_ingest_papers: int = 3            # ingest_arxiv_papers 每轮下载上限（有界，护栏 #2）
     max_pdf_mb: float = 30.0              # 单篇 PDF 体积上限，超出跳过
     ingest_timeout_seconds: float = 120.0  # 下载+增量嵌入+重检索专属超时（含网络/推理）
-    max_collection_papers: int = 200      # arxiv 全文集合容量上限，超出按 LRU 淘汰；0 = 不限
+    max_papers: int = 200                 # 在线入库论文容量上限；手动论文不自动淘汰；0 = 不限
     max_age_days: int = 0                 # 超过这么多天未被检索命中即淘汰；0 = 不按龄期淘汰
 
 
