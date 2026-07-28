@@ -44,6 +44,7 @@ class SourceItem(BaseModel):
     dense_score: float | None = None
     sparse_score: float | None = None
     fusion_score: float | None = None
+    lexical_anchor_score: float = 0.0
     snippet: str | None = None  # 引用原文片段，供回答展示与生成侧评估使用
     image_mime_type: str | None = None
     image_width: int | None = None

@@ -105,7 +105,12 @@ def plan_incremental(
 
 
 def build_index(
-    settings: Settings, incremental: bool = True, verbose: bool = False
+    settings: Settings,
+    incremental: bool = True,
+    verbose: bool = False,
+    *,
+    embedder: Embedder | None = None,
+    build_image_index: bool | None = None,
 ) -> int:
     """为统一论文库构建索引（默认增量），返回 chunk 数量。
 
@@ -122,12 +127,12 @@ def build_index(
     loader = PaperLoader(str(data_dir), pdf_provider=pdf_provider)
     files = list(loader.iter_files())
     cur_files = {str(f): _file_hash(f) for f in files}
-    embedder = Embedder(
+    active_embedder = embedder or Embedder(
         settings.embedding.model_name,
         settings.embedding.use_sentence_transformers,
         settings.embedding.fallback_dimension,
     )
-    params = _params_signature(settings, embedder.signature)
+    params = _params_signature(settings, active_embedder.signature)
 
     store = VectorStore(str(index_dir))
     prev_chunks: list[Chunk] | None = None
@@ -166,7 +171,7 @@ def build_index(
         raise ValueError(f"未找到可索引的论文：{data_dir}")
 
     if new_chunks:
-        new_vectors = embedder.encode([c.content for c in new_chunks])
+        new_vectors = active_embedder.encode([c.content for c in new_chunks])
     else:
         new_vectors = None
 
@@ -180,9 +185,14 @@ def build_index(
         all_vectors,
         files=cur_files,
         params=params,
-        embedding_signature=embedder.signature,
+        embedding_signature=active_embedder.signature,
     )
-    if settings.image_search.enabled:
+    should_build_images = (
+        settings.image_search.enabled
+        if build_image_index is None
+        else build_image_index
+    )
+    if should_build_images:
         PageImageIndex(index_dir).build(
             [path for path in files if path.suffix.lower() == ".pdf"],
             max_pages=settings.image_search.max_pages,

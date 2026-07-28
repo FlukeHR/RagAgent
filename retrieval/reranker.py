@@ -19,16 +19,24 @@ class Reranker:
         self.analyzer = analyzer or QueryAnalyzer()
         self._cross_encoder = None
         self.load_error: str | None = None
-        if use_cross_encoder:
-            try:
-                from sentence_transformers import CrossEncoder
+        self._load_attempted = False
 
-                self._cross_encoder = CrossEncoder(resolve_model_path(model_name))
-            except Exception as exc:
-                self.load_error = str(exc)
+    def _ensure_model(self) -> None:
+        """Load reranker weights only when reranking is actually requested."""
+
+        if self._load_attempted or not self.use_cross_encoder:
+            return
+        self._load_attempted = True
+        try:
+            from sentence_transformers import CrossEncoder
+
+            self._cross_encoder = CrossEncoder(resolve_model_path(self.model_name))
+        except Exception as exc:
+            self.load_error = str(exc)
 
     @property
     def backend(self) -> str:
+        self._ensure_model()
         return "cross_encoder" if self._cross_encoder is not None else "token_overlap"
 
     def rerank(
@@ -39,6 +47,7 @@ class Reranker:
     ) -> list[tuple[Chunk, float]]:
         if not candidates:
             return []
+        self._ensure_model()
         if self._cross_encoder is not None:
             pairs = [[query, item[0].content] for item in candidates]
             scores = self._cross_encoder.predict(pairs)

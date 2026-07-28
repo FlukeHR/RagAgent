@@ -94,6 +94,22 @@ class PaperRAGAgent:
             )
         prepared = self.conversation.prepare(raw_history or [])
         bounded_history = prepared.history
+        smalltalk = self.conversation.smalltalk_response(question)
+        if smalltalk:
+            result = AgentAnswer(
+                answer=smalltalk,
+                steps=["Router: 日常对话直接响应，未启动论文检索"],
+                trace=[{"type": "route", "intent": "smalltalk"}],
+            )
+            return self._finish_request(
+                result,
+                question,
+                raw_history or [],
+                state,
+                prepared.summary,
+                session_id,
+                started,
+            )
         standalone = self._rewrite_query(question, bounded_history)
         clarification = self.conversation.clarification_question(standalone, state)
         drift = self.conversation.drift_question(question, state)
@@ -126,6 +142,13 @@ class PaperRAGAgent:
                 result.steps.insert(0, f"⚠️ agentic 后端调用失败，已降级为本地检索: {exc}")
         else:
             result = self._ask_fallback(question, standalone)
+            issue = self.llm.configuration_issue()
+            if issue:
+                result.steps.insert(0, f"LLM: {issue}，使用本地检索降级路径")
+                result.trace.insert(
+                    0,
+                    {"type": "llm_unavailable", "reason": issue},
+                )
         if prepared.dropped_messages:
             result.trace.insert(
                 0,
@@ -237,11 +260,20 @@ class PaperRAGAgent:
 
         allowed = {"search_local_papers", "read_paper_section"}
         lowered = question.lower()
+        explicit_ingest = bool(
+            re.search(
+                r"(?:\d{4}\.\d{4,5}|[a-z][a-z0-9._-]*/\d{7})(?:v\d+)?",
+                lowered,
+            )
+            and any(term in lowered for term in ("下载", "入库", "全文", "ingest"))
+        )
         if any(
             term in lowered
             for term in ("最新", "近期", "arxiv", "state of the art", "sota")
         ):
-            allowed.update({"search_arxiv", "ingest_arxiv_papers"})
+            allowed.add("search_arxiv")
+        if explicit_ingest:
+            allowed.add("ingest_arxiv_papers")
         if any(
             term in lowered
             for term in ("第", "页", "图", "表", "公式", "bbox", "image", "figure")
@@ -253,6 +285,14 @@ class PaperRAGAgent:
         # remain visible and every call still passes through ToolHarness.
         if any(event.get("type") == "tool" for event in trace):
             allowed = self.tool_registry.names()
+        searched_arxiv = any(
+            event.get("type") == "tool"
+            and event.get("tool") == "search_arxiv"
+            and event.get("ok")
+            for event in trace
+        )
+        if not searched_arxiv and not explicit_ingest:
+            allowed.discard("ingest_arxiv_papers")
         return self.tool_registry.schemas(allowed)
 
     def _ask_agentic(
@@ -336,6 +376,10 @@ class PaperRAGAgent:
                 outcomes = [harness.execute(tc, steps, trace) for tc in turn.tool_calls]
                 conflicts = verifier.conflicts()
                 sources = evidence.as_dicts()
+                # OpenAI-compatible APIs require every assistant tool_call to be
+                # answered by its tool message immediately. Conflict feedback is
+                # a user message, so it must be appended only after all outcomes.
+                self.llm.append_tool_results(history, outcomes)
                 if conflicts:
                     trace.append({"type": "evidence_conflict", "items": conflicts})
                     steps.append(f"Evidence: 检测到 {len(conflicts)} 组潜在冲突，要求显式说明分歧")
@@ -350,7 +394,6 @@ class PaperRAGAgent:
                             ),
                         }
                     )
-                self.llm.append_tool_results(history, outcomes)
                 self._bound_work_history(history, trace)
                 continue
 

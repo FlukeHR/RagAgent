@@ -38,6 +38,7 @@ class EvidenceSource:
     dense_score: float | None = None
     sparse_score: float | None = None
     fusion_score: float | None = None
+    lexical_anchor_score: float = 0.0
     snippet: str | None = None
     image_mime_type: str | None = None
     image_width: int | None = None
@@ -75,6 +76,7 @@ class EvidenceSource:
         dense_score: float | None = None,
         sparse_score: float | None = None,
         fusion_score: float | None = None,
+        lexical_anchor_score: float = 0.0,
     ) -> "EvidenceSource":
         """Build canonical evidence from a retrieval chunk without losing metadata."""
 
@@ -99,6 +101,7 @@ class EvidenceSource:
             dense_score=dense_score,
             sparse_score=sparse_score,
             fusion_score=fusion_score,
+            lexical_anchor_score=round(float(lexical_anchor_score), 4),
             snippet=chunk.content[:snippet_chars],
             quality_rank={
                 "element": 4,

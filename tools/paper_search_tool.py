@@ -69,6 +69,7 @@ class PaperSearchTool:
                     dense_score=r.dense_score,
                     sparse_score=r.sparse_score,
                     fusion_score=r.fusion_score,
+                    lexical_anchor_score=r.lexical_anchor_score,
                 )
             )
         return ToolResult(

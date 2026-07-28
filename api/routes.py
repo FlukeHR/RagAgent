@@ -4,6 +4,7 @@ import re
 from functools import lru_cache
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
 from agent.graph import PaperRAGAgent
 from api.schemas import (
@@ -17,8 +18,9 @@ from api.schemas import (
     TitleResponse,
     Turn,
 )
-from config.settings import load_settings
+from config.settings import BASE_DIR, load_settings
 from llm.model import LLMClient
+from retrieval.repository import InvalidPaperId, PaperRepository
 from services import ArxivSearchService, PaperLibraryService
 
 router = APIRouter()
@@ -27,6 +29,21 @@ router = APIRouter()
 @lru_cache(maxsize=1)
 def _get_agent() -> PaperRAGAgent:
     return PaperRAGAgent(settings=load_settings())
+
+
+@router.get("/papers/{paper_id}/pdf", response_class=FileResponse)
+def preview_pdf(paper_id: str) -> FileResponse:
+    """Serve one repository PDF inline for the browser's native previewer."""
+
+    settings = load_settings()
+    repository = PaperRepository(BASE_DIR / settings.project.data_root)
+    try:
+        pdf_path = repository.resolve(paper_id, (".pdf",))
+    except InvalidPaperId as exc:
+        raise HTTPException(status_code=400, detail="无效的论文标识") from exc
+    if pdf_path is None:
+        raise HTTPException(status_code=404, detail=f"无 PDF 可预览: {paper_id}")
+    return FileResponse(path=pdf_path, media_type="application/pdf")
 
 
 @router.post("/ask", response_model=AskResponse)

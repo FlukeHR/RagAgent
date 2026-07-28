@@ -41,6 +41,40 @@ class ConversationManager:
     continuation_terms = ("继续", "它", "这个", "那个", "上述", "刚才", "再说")
     switch_terms = ("换个话题", "另一个问题", "接下来问", "重新开始", "切换到")
 
+    @staticmethod
+    def smalltalk_response(question: str) -> str | None:
+        """Handle brief social turns without invoking retrieval or model weights."""
+
+        normalized = re.sub(r"[\s，,。.!！?？~～]+", "", question).lower()
+        if normalized in {
+            "你好",
+            "您好",
+            "嗨",
+            "哈喽",
+            "hello",
+            "hi",
+            "hey",
+            "早上好",
+            "上午好",
+            "中午好",
+            "下午好",
+            "晚上好",
+        }:
+            return (
+                "你好！我可以帮你检索、阅读和分析学术论文。"
+                "你想了解哪篇论文或哪个研究问题？"
+            )
+        if normalized in {"谢谢", "感谢", "多谢", "thanks", "thankyou"}:
+            return "不客气。如果还想继续查论文、核对出处或比较方法，直接告诉我就好。"
+        if normalized in {"再见", "拜拜", "bye", "goodbye"}:
+            return "再见！需要继续研究论文时随时来找我。"
+        if normalized in {"你是谁", "你能做什么", "你可以做什么", "你的功能"}:
+            return (
+                "我是学术论文研究助手，可以检索本地论文与 arXiv、阅读章节和 PDF 页面，"
+                "并基于可回查的来源回答问题。"
+            )
+        return None
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
@@ -129,6 +163,9 @@ class ConversationManager:
         sources: list[dict],
         summary: str,
     ) -> ConversationState:
+        if self.smalltalk_response(question):
+            state.summary = summary
+            return state
         if not state.goal or any(term in question for term in self.switch_terms):
             state.goal = question[:500]
         state.summary = summary

@@ -29,20 +29,29 @@ class Embedder:
             alternate_sign=False,
             norm=None,
         )
-        if use_sentence_transformers:
-            try:
-                from sentence_transformers import SentenceTransformer
+        self._load_attempted = False
 
-                self._st_model = SentenceTransformer(resolve_model_path(model_name))
-            except Exception as exc:  # local deterministic fallback, recorded in manifest
-                self.load_error = str(exc)
+    def _ensure_model(self) -> None:
+        """Load model weights on first dense operation, never during API startup."""
+
+        if self._load_attempted or not self.use_sentence_transformers:
+            return
+        self._load_attempted = True
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self._st_model = SentenceTransformer(resolve_model_path(self.model_name))
+        except Exception as exc:  # local deterministic fallback, recorded in manifest
+            self.load_error = str(exc)
 
     @property
     def backend(self) -> str:
+        self._ensure_model()
         return "sentence_transformers" if self._st_model is not None else "hashing"
 
     @property
     def dimension(self) -> int:
+        self._ensure_model()
         if self._st_model is not None:
             return int(self._st_model.get_sentence_embedding_dimension())
         return self.fallback_dimension
@@ -61,6 +70,7 @@ class Embedder:
         return payload
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
+        self._ensure_model()
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
         if self._st_model is not None:

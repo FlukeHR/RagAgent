@@ -65,6 +65,7 @@ class ImageSearchConfig:
     max_pages: int = 80
     max_side: int = 256
     max_query_base64_chars: int = 2_000_000
+    rebuild_on_ingest: bool = False
 
 
 @dataclass
@@ -88,6 +89,7 @@ class ArxivConfig:
     max_papers: int = 200                 # 在线入库论文容量上限；手动论文不自动淘汰；0 = 不限
     max_age_days: int = 0                 # 超过这么多天未被检索命中即淘汰；0 = 不按龄期淘汰
     request_timeout_seconds: float = 60.0
+    use_cross_encoder_after_ingest: bool = False
 
 
 @dataclass

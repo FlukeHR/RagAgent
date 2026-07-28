@@ -1,7 +1,7 @@
 # 项目问题与处理方法
 
-> 更新时间：2026-07-25  
-> 本文回答“当前代码如何处理”。真实性能指标尚未执行，不填写虚构的提升数字；评测由项目维护者按 `EVALUATION_GUIDE.md` 完成。
+> 更新时间：2026-07-27
+> 本文回答“当前代码如何处理”，并记录已经完成的 baseline。完整实验条件和原始结果解释见 `EVALUATION_GUIDE.md`。
 
 ## 1. 工具调用超时怎么办？
 
@@ -54,9 +54,8 @@ source 数和内部 metadata。
 
 **状态：已处理。**
 
-`ConversationManager` 检查过短问题和“这个、哪个更好、帮我看看、比较一下”等缺少对象的表达。
-若历史和会话状态不能补全：
-
+- `ConversationManager` 检查过短问题和“这个、哪个更好、帮我看看、比较一下”等缺少对象的表达。
+  若历史和会话状态不能补全：
 - 返回 `status=needs_clarification`；
 - 暂停工具调用；
 - 追问研究对象、比较对象、评价标准；
@@ -114,28 +113,22 @@ source 数和内部 metadata。
 
 ## 7. 做 RAG 后问答命中率有没有提升？
 
-**状态：没做过真实对照，没有结果；评测工具已经补齐。**
+**状态：已完成公开数据 baseline；尚无改动前后的 candidate 对照。**
 
-可以运行：
+QASPER dev 的 888 个问题已经完成同环境检索消融：
 
-```powershell
-python evaluation/benchmark_retrieval.py
-```
+- Dense：Hit@5=0.6002、MRR=0.3582、Recall@5=0.4494；
+- BM25：Hit@5=0.5721、MRR=0.3282、Recall@5=0.4227；
+- Hybrid/RRF：Hit@5=0.6318、MRR=0.4063、Recall@5=0.4767；
+- Hybrid/RRF/CrossEncoder：Hit@5=0.6959、MRR=0.4710、Recall@5=0.5375。
 
-脚本比较：
-
-- Dense only；
-- BM25 only；
-- Dense + BM25 + RRF；
-- Dense + BM25 + RRF + reranker；
-- 不同 top-k/top-n。
-
-指标包括 Hit@k、MRR、nDCG@k 和 Recall@k，并保存 commit、配置、模型 backend 和环境。
-只有运行同环境 baseline/candidate 后才能回答提升多少。
+这证明当前同一评测链里 Hybrid + CrossEncoder 优于 Dense baseline，但不能表述为“项目改造后
+提升”，因为还没有固定旧 commit 作为 candidate 的对照。统一复现命令是
+`python evaluation/evaluate.py --profile key`。
 
 ## 8. token 成本有没有压？
 
-**状态：没做过真实前后对比，没有结果；统计能力已经补齐。**
+**状态：已得到 smoke usage；没有价格和前后对照，不能声称成本下降。**
 
 现在 trace 统一记录：
 
@@ -144,14 +137,17 @@ python evaluation/benchmark_retrieval.py
 - 每请求总 input/output token；
 - 根据配置单价计算的 estimated cost。
 
-`evaluation/benchmark_e2e.py` 会汇总整套问题的 token 和成本。
-`eval_generation.py` 记录回答生成 usage，并在 LangChain 版本支持时记录 RAGAS judge usage。
+QASPER 生成 smoke 的 5 个回答共使用 5,024 input token、1,391 output token，RAGAS judge
+记录 94,533 total token。当前 `evaluation.input_price_per_million` 和 output price 都是 0，
+旧 E2E 报告的 `estimated_cost=0` 只是配置结果，不是免费或成本已下降的证据。
+
+`evaluation/evaluate.py --profile key --yes` 会统一记录生成、E2E 和 judge usage。
 
 最终账单必须与供应商 billing 核对，不能只使用本地估算。
 
 ## 9. 回答延迟从多少降到了多少？
 
-**状态：没做过 baseline/candidate 对比，没有结果；计时能力已经补齐。**
+**状态：旧 E2E 数据无效，计时算法已修正，等待补齐 answerable 用例后重跑。**
 
 现在记录：
 
@@ -159,19 +155,17 @@ python evaluation/benchmark_retrieval.py
 - 每次 LLM 调用耗时；
 - 每个 tool 总耗时；
 - retrieval 的 store、embedding、Dense、Sparse、fusion/rerank 分阶段耗时；
-- E2E first-byte、mean、p50、p95、p99。
+- E2E response headers、mean、p50、p95、p99；非流式接口不记录伪 TTFT。
 
-运行：
-
-```powershell
-python evaluation/benchmark_e2e.py --yes
-```
+旧报告只覆盖 10 次追问请求。原脚本把小样本分位数向下取整，p50 错报 44.8 ms；从原始记录
+线性插值得到 p50=635.1 ms、p95=1878.8 ms。此外 `/ask` 是非流式 JSON，旧字段
+`first_byte` 其实是响应头耗时，不是模型 TTFT。以上问题已修正，但旧结果不能用于宣称延迟改善。
 
 需要分别比较冷启动、热启动、本地检索、二次检索、PDF、图片和 arXiv 路径。
 
 ## 10. 幻觉率有没有测？
 
-**状态：没跑过真实评测，没有幻觉率数字；在线护栏和评测方法已具备。**
+**状态：已跑 5 样本 RAGAS smoke；人工引用审计尚未形成有效样本。**
 
 在线处理：
 
@@ -181,16 +175,13 @@ python evaluation/benchmark_e2e.py --yes
 - 证据不足会拒答；
 - potential conflict 不会被当作一致结论。
 
-离线评测：
+5 样本结果为 Faithfulness=0.7500、Answer Relevancy=0.5836、Context Precision=0.5000、
+Context Recall=0.6500、Answer Correctness=0.4631、Factual Correctness=0.0000。样本太少，
+不能外推为系统幻觉率。
 
-```powershell
-$env:RAG_EVAL_ALLOW_API = "1"
-python evaluation/eval_generation.py --limit 20
-python evaluation/audit_citations.py evaluation/results/e2e_benchmark.json
-```
-
-RAGAS 负责 Faithfulness、Relevancy、Context Precision/Recall 和可用时的 Correctness；
-CSV 人工审计负责 supported、partially supported、unsupported 和 bad citation。
+旧 E2E 只有追问响应，没有 answered/source/citation，故审计 CSV 为 0 条；这不表示幻觉率为 0。
+现在统一入口会自动接审计并为 0 条结果写明原因。最终仍由 CSV 人工标注 supported、
+partially supported、unsupported 和 bad citation。
 
 ## 11. 是否出现过 badcase，是怎么处理的？
 
@@ -217,13 +208,13 @@ unsupported claim、bad citation、false refusal、timeout、stale index 和 pro
 → 定位 parser/chunk/recall/rerank/context/generation/harness
 → 加最小回归测试
 → 单因素修复
-→ unittest + Ruff + mypy + QASPER
+→ Ruff + mypy + QASPER smoke
 → 必要时显式授权 RAGAS
 ```
 
 ## 12. 切片策略怎么选择的？
 
-**状态：工程策略已重构；最终参数没有实测选型结果。**
+**状态：已完成 FinanceBench sweep；生产参数仍需结合生成 token/延迟确认。**
 
 当前策略：
 
@@ -236,29 +227,24 @@ unsupported claim、bad citation、false refusal、timeout、stale index 和 pro
 - Chunk 保留 paper、section、page、bbox、modality、parent、granularity 和 content hash；
 - retrieval 限制同一 parent 的最大结果数。
 
-默认 900/150 仍是 baseline，不是最优结论。真实论文 gold 数据准备好后运行：
-
-```powershell
-python evaluation/benchmark_grounded.py
-```
+FinanceBench 的 150 个问题上，解析 evidence coverage=0.9853、gold page token F1=0.9722。
+已测组合中 1400/140、Top-20 得到 Page Hit=0.3867、Evidence Hit=0.3867、MRR=0.1837；
+900/135、Top-20 对应 0.3267、0.3533、0.1609。配置已改为 chunk 1400/140、recall top-k=20、
+rerank top-n=5；由于还没有同条件生成 token、延迟和本地论文 gold 回归，目前仍视为候选参数。
 
 ## 13. top-k 怎么调？
 
-**状态：自动 sweep 已实现；最终值没测。**
+**状态：QASPER 与 FinanceBench 已完成 sweep；候选值已有，生产值尚未定稿。**
 
 推荐先调 recall top-k，再调 rerank top-n，最后结合生成质量、延迟和 token 选择。
 
-```powershell
-python evaluation/benchmark_retrieval.py `
-  --top-k 8,12,24 `
-  --top-n 3,5,8
-```
-
-不要只选最高 Recall：top-k 增大通常会增加 rerank 延迟、上下文 token 和噪声。
+QASPER 的 recall top-k=24、rerank top-n=8 得到 Hit@8=0.7849、MRR=0.4872、Recall@8=0.6397；
+Top-5 的 12/5 配置为 Hit@5=0.6959、MRR=0.4710、Recall@5=0.5375。不要只选最高 Recall：
+top-k/top-n 增大也会增加 rerank 延迟、上下文 token 和噪声。
 
 ## 14. 找回效果有没有对比？
 
-**状态：对比代码已实现，真实结果没跑。**
+**状态：公开数据真实结果已跑，本地论文 gold 对比未跑。**
 
 QASPER 消融覆盖 Dense、BM25、Hybrid 和 Hybrid+reranker。生产 grounded benchmark 覆盖 chunk、
 overlap 和 top-k。生产与评估现在共用 `RetrievalPipeline`，避免评估脚本复制另一套 RRF/rerank。
@@ -291,4 +277,3 @@ tool 保持原子能力；profile/skill 只负责“允许模型看到哪些 too
 
 这种设计理论上能降低无必要下载、embedding、schema token 和上下文噪声，但是否优于其他工具链，
 必须由维护者完成真实消融、延迟、成本和幻觉评测后再下结论。
-

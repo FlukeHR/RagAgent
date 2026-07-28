@@ -5,6 +5,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from config.settings import LLMConfig
 
@@ -52,12 +53,35 @@ class LLMClient:
         return events
 
     # ---------- 可用性 ----------
+    def _api_key(self) -> str:
+        """Return the configured secret without ever logging or tracing it."""
+
+        return self.config.openai_api_key or os.getenv("OPENAI_API_KEY") or ""
+
+    def _is_local_endpoint(self) -> bool:
+        """Whether an OpenAI-compatible endpoint can reasonably be keyless."""
+
+        if not self.config.openai_api_base:
+            return False
+        hostname = (urlparse(self.config.openai_api_base).hostname or "").lower()
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
     def _openai_configured(self) -> bool:
-        return bool(
-            self.config.openai_api_base
-            or self.config.openai_api_key
-            or os.getenv("OPENAI_API_KEY")
-        )
+        # A remote URL alone is not a usable backend. Previously this returned
+        # True for the checked-in DeepSeek URL even when no key was present, so
+        # every request first failed authentication and was mislabeled as an
+        # intermittent agentic outage. Keyless mode is retained for local
+        # OpenAI-compatible servers such as Ollama/vLLM.
+        return bool(self._api_key() or self._is_local_endpoint())
+
+    def configuration_issue(self) -> str | None:
+        """Describe why the configured backend cannot be used, if applicable."""
+
+        if self._openai_configured():
+            return None
+        if self.config.openai_api_base:
+            return "远程 OpenAI-compatible 后端缺少 OPENAI_API_KEY"
+        return "未配置 OpenAI-compatible 后端"
 
     def supports_agentic(self) -> bool:
         """是否能走带工具调用的 agentic 循环。"""
@@ -101,13 +125,51 @@ class LLMClient:
                 }
             )
 
+    @staticmethod
+    def _validate_tool_message_sequence(history: list[dict]) -> None:
+        """Reject malformed tool-call history before sending it to a provider."""
+
+        pending: list[str] = []
+        for message in history:
+            role = message.get("role")
+            if pending:
+                if role != "tool":
+                    raise ValueError(
+                        "assistant tool_calls must be followed immediately by "
+                        "one tool message for every tool_call_id"
+                    )
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if tool_call_id not in pending:
+                    raise ValueError(
+                        f"unexpected tool_call_id in message history: {tool_call_id}"
+                    )
+                pending.remove(tool_call_id)
+                continue
+            if role == "tool":
+                raise ValueError("tool message has no pending assistant tool_call")
+            if role == "assistant" and message.get("tool_calls"):
+                pending = [
+                    str(item.get("id") or "")
+                    for item in message["tool_calls"]
+                ]
+                if not all(pending) or len(pending) != len(set(pending)):
+                    raise ValueError("assistant tool_calls contain missing or duplicate ids")
+        if pending:
+            raise ValueError(
+                "assistant tool_calls are missing responses for: "
+                + ", ".join(pending)
+            )
+
     # ---------- OpenAI 兼容实现 ----------
     def _openai_client(self):
         import httpx
         from openai import OpenAI
 
+        if not self._openai_configured():
+            raise RuntimeError(self.configuration_issue() or "LLM 后端不可用")
+
         return OpenAI(
-            api_key=self.config.openai_api_key or os.getenv("OPENAI_API_KEY") or "not-needed",
+            api_key=self._api_key() or "not-needed",
             base_url=self.config.openai_api_base or None,
             timeout=httpx.Timeout(
                 self.config.request_timeout_seconds,
@@ -133,6 +195,7 @@ class LLMClient:
     def _openai_turn(
         self, system: str, history: list[dict], tools: list[dict]
     ) -> LLMTurn:
+        self._validate_tool_message_sequence(history)
         client = self._openai_client()
         messages = [{"role": "system", "content": system}, *history]
         started = time.perf_counter()

@@ -20,7 +20,8 @@ class ArxivTool:
             "name": "search_arxiv",
             "description": (
                 "在线检索 arXiv 摘要；本地证据不足或用户要求最新研究时使用。"
-                "需要全文时再调用 ingest_arxiv_papers。"
+                "作者、时间、主题和高层结论优先使用摘要作答；只有确实需要全文细节时"
+                "才调用 ingest_arxiv_papers，以避免高延迟入库。"
             ),
             "input_schema": {
                 "type": "object",

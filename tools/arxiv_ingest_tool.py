@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from config.settings import BASE_DIR, Settings
 from retrieval.retriever import Retriever
 from retrieval.repository import normalize_arxiv_id
@@ -29,7 +31,8 @@ class ArxivIngestTool:
         return {
             "name": "ingest_arxiv_papers",
             "description": (
-                "下载已由 search_arxiv 选定的少量论文并增量入库，然后只在这些论文中检索。"
+                "高延迟全文工具：下载 search_arxiv 选定的最相关一篇论文，增量入库后"
+                "只在该论文中检索。仅在摘要不足以回答正文细节时使用。"
             ),
             "input_schema": {
                 "type": "object",
@@ -65,7 +68,20 @@ class ArxivIngestTool:
         report = self.library.ingest_arxiv(normalized)
         results = []
         if report.storage_ids and report.indexed_chunks:
-            retriever = Retriever(self.settings, str(self.index_dir))
+            retrieval_settings = self.settings
+            if not self.settings.arxiv.use_cross_encoder_after_ingest:
+                retrieval_settings = replace(
+                    self.settings,
+                    rerank=replace(
+                        self.settings.rerank,
+                        use_cross_encoder=False,
+                    ),
+                )
+            retriever = Retriever(
+                retrieval_settings,
+                str(self.index_dir),
+                embedder=self.library.last_embedder,
+            )
             results = retriever.search(query, paper_ids=set(report.storage_ids))
 
         note_parts = []
@@ -98,6 +114,7 @@ class ArxivIngestTool:
                     dense_score=result.dense_score,
                     sparse_score=result.sparse_score,
                     fusion_score=result.fusion_score,
+                    lexical_anchor_score=result.lexical_anchor_score,
                 )
             )
         return ToolResult(

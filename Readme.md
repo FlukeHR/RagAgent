@@ -85,6 +85,16 @@ llm:
 export OPENAI_API_KEY=your-key
 ```
 
+PowerShell 使用：
+
+```powershell
+$env:OPENAI_API_KEY = "your-key"
+uvicorn api.main:app --reload
+```
+
+远程 `openai_api_base` 必须同时提供密钥；只配置远程 URL 不会被视为可用的
+Agentic 后端。本地 Ollama/vLLM 的 `localhost`、`127.0.0.1`、`::1` 端点仍可无密钥运行。
+
 本地 Ollama 示例：
 
 ```yaml
@@ -147,18 +157,16 @@ curl -X POST http://127.0.0.1:8000/ask \
 评估只保留官方 QASPER：
 
 ```bash
-python evaluation/eval_qasper.py --sweep
-RAG_EVAL_ALLOW_API=1 python evaluation/eval_generation.py --limit 20
-python evaluation/benchmark_retrieval.py
-python evaluation/benchmark_grounded.py
-python evaluation/benchmark_e2e.py --yes
+python evaluation/evaluate.py --profile smoke
+python evaluation/evaluate.py --profile key
+# 启动 API 后，显式授权生成、E2E 与引用审计
+python evaluation/evaluate.py --profile key --yes
 ```
 
 - `eval_qasper.py`：Hit@k、MRR、nDCG、Recall。
 - `eval_generation.py`：RAGAS faithfulness、answer relevancy、context precision 等。
-- `benchmark_retrieval.py`：Dense/BM25/Hybrid/Rerank 消融和 top-k/top-n sweep。
-- `benchmark_grounded.py`：在真实论文库 gold evidence 上比较 chunk/top-k。
-- `benchmark_e2e.py`：端到端延迟、first-byte、token 和成本汇总。
+- `evaluate.py`：统一运行检索、PDF、生成、E2E 与引用审计，结果汇总到 `key_metrics.json`。
+- 其余 `eval_*` / `benchmark_*` 是统一入口使用的单数据集适配器，只在调试时直接运行。
 - `audit_citations.py`：导出 claim/source 对供人工幻觉审计。
 
 RAGAS 会调用真实 API，必须显式授权。

@@ -96,8 +96,8 @@
 - [x] 增加 CJK analyzer、重复 chunk、page bbox 和 metadata 测试。
 - [x] 增加 Evidence 编号、去重、无效引用和数值冲突测试。
 - [x] 增加模糊澄清、主题偏移、历史压缩和 SQLite 记忆测试。
-- [x] CI 增加 Ruff、unittest 和非阻断 mypy。
-- [x] 本地验证：Ruff 通过、mypy 通过、13 个 unittest 通过、实际索引构建和检索 smoke test 通过。
+- [x] CI 保留 Ruff 和非阻断 mypy；维护者决定移除 `tests/` 后同步删除 unittest 步骤。
+- [x] 本地验证使用 Ruff、mypy、实际索引构建和检索 smoke evaluation。
 - [x] RAGAS 保持显式付费授权，不进入自动 CI。
 
 ## 待维护者执行的真实评测

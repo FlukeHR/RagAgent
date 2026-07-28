@@ -16,10 +16,17 @@ from retrieval.vector_store import VectorStore
 class Retriever:
     """Filterable Dense + BM25 + RRF + diversification + reranking pipeline."""
 
-    def __init__(self, settings: Settings, index_dir: str) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        index_dir: str,
+        embedder: Embedder | None = None,
+    ) -> None:
+        """Create a retriever, optionally reusing an already-loaded embedder."""
+
         self.settings = settings
         self.analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
-        self.embedder = Embedder(
+        self.embedder = embedder or Embedder(
             settings.embedding.model_name,
             settings.embedding.use_sentence_transformers,
             settings.embedding.fallback_dimension,

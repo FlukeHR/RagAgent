@@ -45,13 +45,30 @@ def _patch_langchain_community() -> None:
     except Exception:  # noqa: BLE001 - 缺失则注入占位
         pass
     mod = types.ModuleType(name)
-    mod.ChatVertexAI = type("ChatVertexAI", (), {})  # 仅占位，不会被实际调用
+    setattr(
+        mod,
+        "ChatVertexAI",
+        type("ChatVertexAI", (), {}),
+    )  # 仅占位，不会被实际调用
     sys.modules[name] = mod
 
 
 def authorized(yes_flag: bool) -> bool:
     """是否已显式授权调用真实 API。"""
     return bool(yes_flag) or os.getenv("RAG_EVAL_ALLOW_API") == "1"
+
+
+def evaluation_api_key(settings) -> str:
+    """Resolve the paid-evaluation credential without logging its value."""
+
+    key = settings.llm.openai_api_key or os.getenv("OPENAI_API_KEY") or ""
+    if not key.strip():
+        raise ValueError(
+            "缺少 OPENAI_API_KEY。RAG_EVAL_ALLOW_API=1 只表示允许付费调用，"
+            "不是 API 凭证。请在当前终端设置 OPENAI_API_KEY；"
+            "本地免认证接口可显式设置为 not-needed。"
+        )
+    return key
 
 
 # ---------- 官方 QASPER 生成侧（单文档 QA：在该论文内检索→生成→以 gold answer 为 reference） ----------
@@ -70,13 +87,13 @@ def qasper_reference(qa: dict) -> str | None:
     return None
 
 
-def _retrieve_chunks(query, chunks, vecs, embedder, reranker, settings, top_n):
-    """在单篇论文的段落里检索 top_n（稠密+BM25 RRF→重排），与生产/eval_qasper 同构。"""
+def _retrieve_results(query, chunks, vecs, embedder, reranker, settings, top_n):
+    """在单篇论文内返回完整检索结果，保留分数、置信度和 backend。"""
     from retrieval.analyzer import QueryAnalyzer
     from retrieval.pipeline import rank_in_memory
 
     analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
-    results = rank_in_memory(
+    return rank_in_memory(
         query,
         chunks,
         vecs,
@@ -90,14 +107,12 @@ def _retrieve_chunks(query, chunks, vecs, embedder, reranker, settings, top_n):
         rrf_k=settings.index.rrf_k,
         max_chunks_per_parent=settings.index.max_chunks_per_parent,
     )
-    return [result.chunk for result in results]
 
 
-def _gen_prompt(question: str, chunks) -> str:
+def _gen_prompt(question: str, contexts) -> str:
     from llm.prompt_builder import build_generation_prompt
-    from retrieval.retriever import RetrievalResult
 
-    return build_generation_prompt(question, [RetrievalResult(chunk=c, score=0.0) for c in chunks])
+    return build_generation_prompt(question, contexts)
 
 
 def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = None,
@@ -132,7 +147,7 @@ def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = Non
             ref = qasper_reference(qa)
             if not ref:  # 跳过 unanswerable / 无可用参考答案
                 continue
-            top = _retrieve_chunks(
+            top = _retrieve_results(
                 qa["question"],
                 chunks,
                 vecs,
@@ -144,7 +159,8 @@ def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = Non
             response = llm.generate(_gen_prompt(qa["question"], top))
             samples.append({
                 "user_input": qa["question"],
-                "retrieved_contexts": [c.content for c in top] or ["(empty)"],
+                "retrieved_contexts": [item.chunk.content for item in top]
+                or ["(empty)"],
                 "response": response,
                 "reference": ref,
             })
@@ -154,7 +170,7 @@ def collect_samples_qasper(dataset: dict, settings, llm, limit: int | None = Non
 
 
 # ---------- ragas 后端构造 ----------
-def _build_judge(settings):
+def _build_judge(settings, api_key: str):
     """按项目 LLM 配置构造 ragas 的 judge LLM + 本地嵌入（避免嵌入 API）。"""
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
@@ -165,7 +181,7 @@ def _build_judge(settings):
     llm = ChatOpenAI(
         model=cfg.model_name,
         base_url=cfg.openai_api_base or None,
-        api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
+        api_key=api_key,
     )
 
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -237,6 +253,11 @@ def main() -> None:
         sys.exit(1)
 
     settings = load_settings()
+    try:
+        api_key = evaluation_api_key(settings)
+    except ValueError as exc:
+        print(f"[GenEval] {exc}")
+        sys.exit(2)
 
     qpath = Path(args.qasper)
     if not qpath.exists():
@@ -260,7 +281,7 @@ def main() -> None:
         print("没有可评估的样本（QASPER 全 unanswerable，或评估集为空）。")
         sys.exit(1)
 
-    judge_llm, judge_emb = _build_judge(settings)
+    judge_llm, judge_emb = _build_judge(settings, api_key)
     dataset = EvaluationDataset.from_list(samples)
     print(f"[GenEval] 评分 {len(samples)} 条样本…")
     judge_usage = {}

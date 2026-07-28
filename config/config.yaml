@@ -5,9 +5,11 @@ project:
 index:
   index_root: ./data/indexes
   # 论文按字符窗口切块（尽量落在段落边界），比按行更适合自然语言
-  chunk_size: 900
-  chunk_overlap: 150
-  top_k_recall: 12
+  # FinanceBench baseline：1400/10% 在命中率、MRR 和 chunk 数上综合最佳。
+  chunk_size: 1400
+  chunk_overlap: 140
+  # 召回 20 条供 CrossEncoder 重排，最终仅保留 5 条进入生成上下文。
+  top_k_recall: 20
   top_n_rerank: 5
   rrf_k: 60
   max_chunks_per_parent: 2
@@ -48,6 +50,8 @@ pdf_parse:
 
 image_search:
   enabled: true
+  # 在线 arXiv 入库时不重画全部页面；手动 build_index.py 仍会更新图像索引。
+  rebuild_on_ingest: false
   max_pages: 80
   max_side: 256
   max_query_base64_chars: 2000000
@@ -65,12 +69,14 @@ llm:
 
 arxiv:
   max_results: 5
-  max_ingest_papers: 3          # ingest_arxiv_papers 每轮下载上限（有界）
+  max_ingest_papers: 1          # 在线问答每轮只入库最相关的一篇，避免长时间阻塞
   max_pdf_mb: 30                # 单篇 PDF 体积上限（MB），超出跳过
   ingest_timeout_seconds: 120   # 下载+增量嵌入+重检索的专属超时（含网络/推理）
   max_papers: 200               # 在线入库论文容量上限；手动放入 papers 的论文不自动淘汰；0=不限
   max_age_days: 0               # 超 N 天未被检索命中即淘汰；0=不按龄期淘汰
   request_timeout_seconds: 60   # arXiv 搜索/下载单次网络请求超时
+  # 新论文即时检索使用轻量 token 重排，避免在隔离进程再次加载 CrossEncoder。
+  use_cross_encoder_after_ingest: false
 
 harness:
   tool_timeout_seconds: 30   # 单次工具调用超时

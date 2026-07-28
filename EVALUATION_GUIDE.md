@@ -1,7 +1,97 @@
 # RAG 真实评测指南
 
-本指南由项目维护者执行。代码和评测入口已经准备好，但仓库没有真实 baseline/candidate 结果。
-第一次运行只能称为 baseline；只有在同一数据、模型、硬件和运行方式下比较，才能报告“提升了多少”。
+本指南记录 2026-07-25 至 2026-07-27 已完成的 baseline，并说明如何复现。只有在同一数据、
+模型、硬件和运行方式下比较，才能报告“提升了多少”。`evaluation/results/` 默认不提交 Git，
+下表数字来自当前工作区保存的原始报告。
+
+## 统一入口
+
+日常评测只使用一个入口。默认运行 QASPER 检索消融和 FinanceBench 的解析、切片、检索指标，
+不调用付费 LLM API：
+
+```powershell
+python evaluation/evaluate.py --profile key
+```
+
+快速检查使用 `--profile smoke`；完整参数网格使用 `--profile full`。OmniDocBench OCR 较慢，
+可在 smoke/key 中显式加入：
+
+```powershell
+python evaluation/evaluate.py --profile smoke --omnidoc
+```
+
+生成、E2E 和引用审计需要真实 API。先启动 API，再显式授权；引用审计会在 E2E 后自动执行：
+
+```powershell
+uvicorn api.main:app
+python evaluation/evaluate.py --profile key --yes
+```
+
+一次运行的分阶段结果和汇总写入 `evaluation/results/latest/`，总表是
+`key_metrics.json`。`eval_qasper.py`、`eval_financebench.py`、`eval_omnidocbench.py`、
+`eval_generation.py`、`benchmark_e2e.py` 和 `audit_citations.py` 是统一入口调用的底层适配器，
+只在调试单项时直接运行。
+
+## 已完成测评数据
+
+所有有效检索实验均使用 `sentence-transformers/all-MiniLM-L6-v2`；启用重排时实际 backend 为
+`cross_encoder`（`cross-encoder/ms-marco-MiniLM-L-6-v2`）。报告对应 commit
+`7b9cc79c037a0d70d99396d7420f60cb21aed798`，工作区为 dirty，因此这些数字是当前工作区
+baseline，不是可跨 commit 复用的发布基准。
+
+QASPER dev 共评测 281 篇论文、888 个有 gold evidence 的问题，输出 Top-5：
+
+| 检索链 | Hit@5 | MRR | nDCG@5 | Recall@5 |
+| --- | ---: | ---: | ---: | ---: |
+| Dense | 0.6002 | 0.3582 | 0.3387 | 0.4494 |
+| BM25 | 0.5721 | 0.3282 | 0.3096 | 0.4227 |
+| Hybrid / RRF | 0.6318 | 0.4063 | 0.3732 | 0.4767 |
+| Hybrid / RRF / CrossEncoder | **0.6959** | **0.4710** | **0.4392** | **0.5375** |
+
+在同一 Top-5 口径下，Hybrid + CrossEncoder 相比 Dense 的 Hit@5 增加 9.57 个百分点，MRR
+增加 0.1128；相比不重排 Hybrid，Hit@5 增加 6.42 个百分点，MRR 增加 0.0647。扩大到
+recall top-k=24、rerank top-n=8 时，Hit@8=0.7849、MRR=0.4872、Recall@8=0.6397，
+但上下文更多，不能与 Top-5 的指标直接当作同口径提升。
+
+FinanceBench 使用 150 个问题、84 份 PDF。解析层
+`gold_page_nonempty_rate=1.0000`、`evidence_text_coverage=0.9853`、
+`gold_page_token_f1=0.9722`；900/135 切片的 evidence preservation 为 0.9630，页码 metadata
+准确率为 1.0000。固定 900/135、Top-20 时的检索消融为：
+
+| 检索链 | Paper Hit | Page Hit | Evidence Hit | Evidence Recall | MRR |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BM25 | 0.6800 | 0.1800 | 0.1533 | 0.1478 | 0.0772 |
+| Dense | **0.9267** | 0.3067 | **0.3733** | **0.3478** | 0.1185 |
+| Hybrid / RRF | 0.8933 | **0.3267** | 0.3533 | 0.3322 | 0.1239 |
+| Hybrid / RRF / CrossEncoder | 0.8933 | **0.3267** | 0.3533 | 0.3322 | **0.1609** |
+
+CrossEncoder 在此配置没有提高 Top-20 命中率，但把 MRR 从 0.1239 提高到 0.1609，说明收益
+主要来自顺序。chunk sweep 中 1400/140、Top-20 得到 Page Hit=0.3867、Evidence Hit=0.3867、
+MRR=0.1837，是已测组合中较好的检索结果。当前生产候选已改为 chunk 1400/140、
+recall top-k=20、rerank top-n=5；仍需用本地论文 gold、生成 token 和延迟做上线前复核。
+
+生成侧 smoke 使用 QASPER 5 个问题：Faithfulness=0.7500、Answer Relevancy=0.5836、
+Context Precision=0.5000、Context Recall=0.6500、Answer Correctness=0.4631、
+Factual Correctness=0.0000。回答生成共 5,024 input token、1,391 output token；RAGAS judge
+记录 94,533 total token。样本只有 5 个，且配置单价为 0，不能据此报告总体质量或真实费用。
+
+MMLongBench-Doc 只跑了 10 个问题、2 份 PDF 的 smoke：Top-10 Page Hit=0.6250、
+Page Recall=0.4375、all-gold-pages Hit=0.3750、MRR=0.2583。gold evidence 文本没有接入，
+所以 Evidence Hit=0 不代表检索完全失败。
+
+OmniDocBench 原报告显示 `pages=0`，不是 0 分 baseline：旧代码把 `english` 错映射成 `en`，
+导致 206 个英文 academic_literature 页面全部被过滤。映射和空样本检查已修复，必须重跑后才能
+填写解析成绩。
+
+旧 E2E 报告的 10 次请求只覆盖两个 `needs_clarification` 样本，状态命中 10/10，但没有
+answerable 样本、source 或引用；回答文本也检测到乱码。因此它只能说明追问分支被执行，不能
+作为 E2E 问答、引用、成本或幻觉 baseline。旧脚本还用向下取整计算分位数，把 p50 错报成
+44.8 ms；由原始 10 条 latency 线性插值得到 p50=635.1 ms、p95=1878.8 ms。新入口已修正
+分位数算法，并把旧称 `first_byte` 的非流式响应指标改为 `response_headers_ms`。
+
+`citation_audit.csv` 为 0 字节的原因同样是没有 `answered` 回答可审计。新审计器即使 0 条也会
+写出固定表头和 summary，并把无引用陈述标成 `missing_citation`；自动 overlap 仍不能替代人工
+`supported / partially_supported / unsupported / bad_citation` 标注。
 
 ## 1. 固定实验条件
 
@@ -33,18 +123,6 @@
 pip install -r requirements.txt
 ```
 
-评测依赖：
-
-```powershell
-pip install -r requirements-eval.txt
-```
-
-可选 FAISS：
-
-```powershell
-pip install -r requirements-optional.txt
-```
-
 全量构建生产索引：
 
 ```powershell
@@ -64,80 +142,207 @@ generation
 若实际 backend 是 `hashing` 或 reranker 是 `token_overlap`，报告中必须明确说明，不能写成
 SentenceTransformer/CrossEncoder 的实验结果。
 
-## 3. QASPER 检索评测
+下面两个 PDF 数据集入口都不调用 `LLMClient`，不会产生大模型 API 费用。本地
+SentenceTransformer/CrossEncoder 首次使用时可能从 Hugging Face 下载模型；之后可以离线运行。
 
-把官方 QASPER dev 数据放到：
+## 3. 两套 PDF 基准的目录
+
+数据集本体不提交仓库。下载后整理成：
 
 ```text
-evaluation/data/qasper/qasper-dev-v0.3.json
+evaluation/data/
+├─ omnidocbench/
+│  ├─ OmniDocBench.json
+│  └─ images/
+├─ financebench/
+│  ├─ data/
+│  │  └─ financebench_open_source.jsonl
+│  └─ pdfs/
 ```
 
-先跑小样本：
+官方来源：
+
+- [OmniDocBench](https://github.com/opendatalab/OmniDocBench)
+- [FinanceBench](https://github.com/patronus-ai/financebench)
+
+脚本会递归查找结构化数据和 PDF。若自动发现失败，使用各入口的 `--questions`、`--pdf-dir`
+显式传入。
+
+不再把 MMLongBench-Doc 作为必跑项，也不为了凑满三套引入另一个大文件或受限数据集。
+OmniDocBench 负责解析质量，FinanceBench 负责解析、切片和 evidence 召回，最后用本地论文
+gold set 验证学术领域效果，这三层已经覆盖当前项目需要的选型依据。
+
+### 先确认本地模型 backend
+
+运行 FinanceBench 评测后，检查报告中的：
+
+```text
+embedding.backend
+embedding_load_error
+reranker_backend
+reranker_load_error
+```
+
+正式实验应优先得到：
+
+```text
+sentence_transformers
+cross_encoder
+```
+
+若得到 `hashing`/`token_overlap`，脚本仍能完成离线基线，但不能把结果写成真实语义模型实验。
+
+## 4. OmniDocBench：PDF 页面解析
+
+OmniDocBench 主要提供页面图像和结构化标注。当前项目的 PyMuPDF 原生文本路径不能直接从页面图像
+取得文字，因此有两种运行方式。
+
+### 4.1 使用项目的本地 OCR 路径
+
+先安装 Tesseract，并确认：
 
 ```powershell
-python evaluation/eval_qasper.py `
+tesseract --version
+```
+
+Smoke test：
+
+```powershell
+python evaluation/eval_omnidocbench.py `
+  evaluation/data/omnidocbench/OmniDocBench.json `
+  --images-root evaluation/data/omnidocbench/images `
+  --language english `
+  --data-source academic_literature `
+  --ocr `
+  --limit 20 `
+  --export-predictions evaluation/results/omnidocbench_predictions `
+  --output evaluation/results/omnidocbench_smoke.json
+```
+
+扩大到筛选后的全部页面：
+
+```powershell
+python evaluation/eval_omnidocbench.py `
+  evaluation/data/omnidocbench/OmniDocBench.json `
+  --images-root evaluation/data/omnidocbench/images `
+  --language english `
+  --data-source academic_literature `
+  --ocr `
+  --export-predictions evaluation/results/omnidocbench_predictions `
+  --output evaluation/results/omnidocbench_baseline.json
+```
+
+`--ocr` 只调用本地 Tesseract，不调用 LLM。若不加 `--ocr` 且输入只有页面图像，PyMuPDF
+解析为空是预期结果，这只能说明“原生文本 parser 不适用于扫描页面”。
+
+### 4.2 评测已有 Markdown parser 输出
+
+如果以后接入 MinerU、Marker 或其他 parser，将每页输出保存成与页面图像同名的 `.md`：
+
+```powershell
+python evaluation/eval_omnidocbench.py `
+  evaluation/data/omnidocbench/OmniDocBench.json `
+  --images-root evaluation/data/omnidocbench/images `
+  --predictions-dir path/to/page_markdown `
+  --language english `
+  --data-source academic_literature `
+  --output evaluation/results/omnidocbench_external_parser.json
+```
+
+项目桥接报告包含：
+
+- `text_token_f1`；
+- `text_token_recall`；
+- `ordered_token_similarity`；
+- `table_content_coverage`；
+- `formula_content_coverage`；
+- `empty_prediction_rate`；
+- 每页错误和明细。
+
+这些是项目内的快速、确定性指标，不等同于 OmniDocBench 官方的 TEDS、CDM、COCODet。
+`--export-predictions` 会导出逐页 Markdown；需要论文可比的正式解析成绩时，再按 OmniDocBench
+官方仓库的 `end2end`/`md2md` 配置运行官方 evaluator。官方 evaluator 本身也不需要 LLM API。
+
+## 5. FinanceBench：解析、切片和 evidence 召回
+
+FinanceBench 开源样本带原始 PDF、0-based evidence 页码、原文 evidence 和整页文本。适合同时检查：
+
+```text
+PDF 是否解析出 evidence
+→ evidence 是否被 chunk 保留
+→ evidence chunk 是否进入 Top-K
+```
+
+Smoke test：
+
+```powershell
+python evaluation/eval_financebench.py `
+  evaluation/data/financebench `
   --limit 10 `
-  --mode hybrid `
-  --output evaluation/results/qasper_smoke.json
+  --chunk-sizes 500 `
+  --overlap-ratios 0.15 `
+  --top-k 5,10 `
+  --output evaluation/results/financebench_smoke.json
 ```
 
-完整 baseline：
+完整 chunk sweep：
 
 ```powershell
-python evaluation/eval_qasper.py `
-  --limit 0 `
+python evaluation/eval_financebench.py `
+  evaluation/data/financebench `
+  --chunk-sizes 500,900,1400 `
+  --overlap-ratios 0.10,0.15,0.20 `
+  --top-k 5,10,20 `
   --mode hybrid `
-  --output evaluation/results/qasper_baseline.json
+  --evidence-threshold 0.80 `
+  --output evaluation/results/financebench_baseline.json
 ```
 
-核心指标：
+入口会自动把 FinanceBench 的 0-based `evidence_page_num` 加一，与项目内部 1-based
+`page_start/page_end` 对齐。报告分三层：
 
-- Hit@k：top-k 是否至少命中一个 gold evidence；
-- MRR：第一个正确 evidence 的倒数排名；
-- nDCG@k：正确 evidence 的排序质量；
-- Recall@k：gold evidence 找回比例；
-- Mean top confidence：最高结果的校准后置信度，仅用于后续阈值标定。
+- parsing：`gold_page_nonempty_rate`、`evidence_text_coverage`、`gold_page_token_f1`；
+- chunking：evidence preservation/split/lost、页码 metadata、索引/解析字符比；
+- retrieval：Paper/Page/Evidence Hit@K、跨页全命中率、MRR。
 
-## 4. Retrieval 消融与 top-k/top-n
+`evidence_threshold=0.8` 表示一个 chunk 至少覆盖 gold evidence 的 80% token 才算命中。
+归一化会处理 Unicode、空白、PDF 断词和连字符，但不会用 LLM 做语义判定。
 
-一次运行 Dense、BM25、Hybrid、Hybrid+reranker：
+## 6. FinanceBench 检索消融顺序
 
-```powershell
-python evaluation/benchmark_retrieval.py `
-  --limit 50 `
-  --top-k 8,12,24 `
-  --top-n 3,5,8 `
-  --output evaluation/results/retrieval_ablation.json
-```
-
-候选链：
+固定数据、chunk size、overlap 和 top-k，只改变检索链，依次运行：
 
 ```text
-Dense only
-BM25 only
-Dense + BM25 + RRF
-Dense + BM25 + RRF + reranker
+--mode sparse --no-rerank
+--mode dense --no-rerank
+--mode hybrid --no-rerank
+--mode hybrid
 ```
 
 调参顺序：
 
-1. 先用 Recall@k/MRR 选 recall top-k；
-2. 再用 nDCG、生成质量、延迟和 token 选 rerank top-n；
-3. 不要先跑完整参数笛卡尔积；
-4. 不要只选 Recall 最高的配置。
+1. 先用 evidence/page Recall 和 MRR 选择 recall top-k；
+2. 再比较 reranker 前后排序、延迟和 backend；
+3. 再比较 chunk size 与 overlap；
+4. 最后才接生成模型测试答案质量。
 
-建议报告：
+不同 chunk size 的 Top-K 所含字符/token 数不同，报告时同时观察
+`indexed_to_parsed_char_ratio`，不要只选 Recall 最高的一组。
 
-| mode | top-k | top-n | Hit@k | MRR | Recall@k | backend |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Dense | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| BM25 | 待测 | 待测 | 待测 | 待测 | 待测 | BM25 |
-| Hybrid | 待测 | 待测 | 待测 | 待测 | 待测 | RRF |
-| Hybrid+rerank | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+建议汇总：
 
-## 5. 生产 chunk 策略评测
+| dataset | parser | chunk/overlap | top-k | Page Hit | Evidence Hit | MRR | backend |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| OmniDocBench | 旧结果空过滤，待重跑 | N/A | N/A | N/A | N/A | N/A | Tesseract |
+| FinanceBench | PyMuPDF | 1400/140 | 20 | 0.3867 | 0.3867 | 0.1837 | MiniLM + CrossEncoder |
 
-QASPER 使用标注段落作为 chunk，不能证明生产 900/150 最优。请编辑：
+QASPER 仍可作为 clean-text retrieval 回归，但不再作为 PDF parser/chunker 的主评测：
+
+统一入口的 smoke/key profile 会同时运行 QASPER。
+
+## 7. 本地论文 Gold Set
+
+公开数据集不能替代项目真实论文。请编辑：
 
 ```text
 evaluation/data/business_cases.jsonl
@@ -192,7 +397,10 @@ python evaluation/benchmark_grounded.py `
 - Faithfulness/Correctness 不下降；
 - 可答与不可答拒答行为稳定。
 
-## 6. 生成质量与幻觉
+当前 `benchmark_grounded.py` 仍以论文级命中为主；本地 gold 的正式比较应参照 FinanceBench
+入口使用相同的 evidence/page 指标。公开数据集选完参数后，再用本地用例确认领域迁移没有退化。
+
+## 8. 生成质量与幻觉
 
 该步骤调用真实生成 API 和 RAGAS judge，会计费。先确认：
 
@@ -223,7 +431,7 @@ python evaluation/eval_generation.py `
 
 报告必须写实际 RAGAS 版本和实际启用指标。`judge_usage` 为空时，以供应商账单为准。
 
-## 7. 端到端延迟、token 和成本
+## 9. 端到端延迟、token 和成本
 
 启动：
 
@@ -234,16 +442,13 @@ uvicorn api.main:app
 评测脚本可能调用真实 API，因此需要显式授权：
 
 ```powershell
-python evaluation/benchmark_e2e.py `
-  --yes `
-  --repeat 5 `
-  --output evaluation/results/e2e_baseline.json
+python evaluation/evaluate.py --profile key --yes
 ```
 
 记录：
 
 - total latency mean/p50/p95/p99；
-- first-byte p50/p95；
+- 非流式 `response_headers_ms` p50/p95；
 - input/output token；
 - estimated cost；
 - tool call 数；
@@ -262,7 +467,8 @@ python evaluation/benchmark_e2e.py `
 - arXiv 下载和增量索引；
 - 20 轮以上长历史。
 
-`first-byte` 是 HTTP 首字节，不等价于流式模型首 token；当前 `/ask` 是非流式接口，报告中需使用正确名称。
+当前 `/ask` 是非流式接口，无法测模型首 token。`response_headers_ms` 仅表示客户端收到 HTTP
+响应头的时间；要测 TTFT，必须先实现 SSE/流式响应。
 
 ### 成本公式
 
@@ -284,7 +490,7 @@ cost =
 
 最终同时报告 trace estimated cost 和供应商真实账单。
 
-## 8. 人工引用与幻觉审计
+## 10. 人工引用与幻觉审计
 
 从 E2E 结果导出 claim/source CSV：
 
@@ -316,7 +522,7 @@ over_refusal
 
 自动 token overlap 只用于筛出 `needs_review`，不能替代人工语义判断。
 
-## 9. Badcase 闭环
+## 11. Badcase 闭环
 
 把失败样本写入：
 
@@ -346,27 +552,26 @@ evaluation/data/badcases.jsonl
 → 定位 parser/chunk/recall/rerank/context/generation/harness
 → 添加最小回归样本
 → 单因素修复
-→ Ruff + unittest + mypy
-→ QASPER
+→ Ruff + mypy + 对应数据集 smoke evaluation
+→ OmniDocBench / FinanceBench / 本地论文 gold set
 → 必要时显式授权 RAGAS
 → 记录修复 commit 和新旧指标
 ```
 
-## 10. 最终对照表
+## 12. 最终对照表
 
 | 指标 | baseline | candidate | 变化 | 样本数 |
 | --- | ---: | ---: | ---: | ---: |
-| Hit@k | 待测 | 待测 | 待测 | 待测 |
-| MRR | 待测 | 待测 | 待测 | 待测 |
-| Recall@k | 待测 | 待测 | 待测 | 待测 |
-| Faithfulness | 待测 | 待测 | 待测 | 待测 |
-| Answer Correctness | 待测 | 待测 | 待测 | 待测 |
-| 不受支持陈述率 | 待测 | 待测 | 待测 | 待测 |
-| 正确拒答率 | 待测 | 待测 | 待测 | 待测 |
-| 平均 input token | 待测 | 待测 | 待测 | 待测 |
-| 平均费用 | 待测 | 待测 | 待测 | 待测 |
-| p50 延迟 | 待测 | 待测 | 待测 | 待测 |
-| p95 延迟 | 待测 | 待测 | 待测 | 待测 |
+| QASPER Hit@5 | 0.6959 | 待测 | 待测 | 888 |
+| QASPER MRR | 0.4710 | 待测 | 待测 | 888 |
+| QASPER Recall@5 | 0.5375 | 待测 | 待测 | 888 |
+| Faithfulness | 0.7500 | 待测 | 待测 | 5 |
+| Answer Correctness | 0.4631 | 待测 | 待测 | 5 |
+| 不受支持陈述率 | 无有效人工审计 | 待测 | 待测 | 0 |
+| 正确拒答率 | 未覆盖 rejected 样本 | 待测 | 待测 | 0 |
+| 回答生成平均 input token | 1004.8 | 待测 | 待测 | 5 |
+| 平均费用 | 单价未配置 | 待测 | 待测 | 0 |
+| 有效 E2E p50 延迟 | 待重跑 | 待测 | 待测 | 0 |
+| 有效 E2E p95 延迟 | 待重跑 | 待测 | 待测 | 0 |
 
 只有同条件 baseline/candidate 对照完成后，才能回答命中率提升、token 压缩、延迟下降和幻觉率变化。
-

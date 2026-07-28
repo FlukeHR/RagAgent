@@ -19,6 +19,7 @@ class RetrievalResult:
     sparse_score: float | None = None
     fusion_score: float | None = None
     rerank_score: float | None = None
+    lexical_anchor_score: float = 0.0
 
 
 class ReciprocalRankFusion:
@@ -119,19 +120,30 @@ class RetrievalPipeline:
             ranked = candidates[:output_limit]
             backend = "fusion" if sparse is not None else "dense"
         fusion_scores = {chunk.chunk_id: score for chunk, score in candidates}
-        return [
-            RetrievalResult(
-                chunk=chunk,
-                score=float(score),
-                confidence=ScoreCalibrator.confidence(float(score), backend),
-                backend=backend,
-                dense_score=dense_scores.get(chunk.chunk_id),
-                sparse_score=sparse_scores.get(chunk.chunk_id),
-                fusion_score=fusion_scores.get(chunk.chunk_id),
-                rerank_score=float(score) if use_reranker else None,
+        results: list[RetrievalResult] = []
+        for chunk, score in ranked:
+            anchor_score = self.reranker.analyzer.identifier_overlap(
+                query,
+                f"{chunk.paper_title}\n{chunk.section}\n{chunk.content}",
             )
-            for chunk, score in ranked
-        ]
+            confidence = max(
+                ScoreCalibrator.confidence(float(score), backend),
+                anchor_score,
+            )
+            results.append(
+                RetrievalResult(
+                    chunk=chunk,
+                    score=float(score),
+                    confidence=confidence,
+                    backend=backend,
+                    dense_score=dense_scores.get(chunk.chunk_id),
+                    sparse_score=sparse_scores.get(chunk.chunk_id),
+                    fusion_score=fusion_scores.get(chunk.chunk_id),
+                    rerank_score=float(score) if use_reranker else None,
+                    lexical_anchor_score=anchor_score,
+                )
+            )
+        return results
 
 
 def rank_in_memory(

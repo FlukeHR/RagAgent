@@ -104,7 +104,13 @@ def evaluate_qasper(
     )
     recall_k = top_k or settings.index.top_k_recall
     output_k = top_n or settings.index.top_n_rerank
-    values = {"hit": [], "mrr": [], "ndcg": [], "recall": [], "confidence": []}
+    values: dict[str, list[float]] = {
+        "hit": [],
+        "mrr": [],
+        "ndcg": [],
+        "recall": [],
+        "confidence": [],
+    }
     paper_count = 0
     question_count = 0
 

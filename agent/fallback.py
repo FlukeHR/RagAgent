@@ -37,6 +37,7 @@ class FallbackRAG:
                 "dense_score": result.dense_score,
                 "sparse_score": result.sparse_score,
                 "fusion_score": result.fusion_score,
+                "lexical_anchor_score": result.lexical_anchor_score,
                 "snippet": result.chunk.content[:limit],
             }
             for index, result in enumerate(results, start=1)

@@ -145,7 +145,14 @@ def prune_library(
 
     index_dir = BASE_DIR / settings.index.index_root
     if any(data_dir.glob("*.pdf")):
-        build_index(settings, incremental=True)
+        build_index(
+            settings,
+            incremental=True,
+            build_image_index=(
+                settings.image_search.enabled
+                and settings.image_search.rebuild_on_ingest
+            ),
+        )
     else:
         for name in _INDEX_FILES:
             (index_dir / name).unlink(missing_ok=True)

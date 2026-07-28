@@ -107,6 +107,53 @@
   }
   .typing { color: var(--muted); font-size: 14px; }
 
+  .cite {
+    display: inline-flex; align-items: center; gap: 2px; vertical-align: .25em;
+    margin: 0 2px; padding: 1px 5px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--accent-soft); color: var(--accent);
+    font: inherit; font-size: 11px; line-height: 1.4; cursor: pointer;
+  }
+  .cite:hover { border-color: var(--accent); }
+  .cite svg { width: 12px; height: 12px; flex-shrink: 0; }
+  .source-list {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+    margin-top: 10px; color: var(--muted); font-size: 12px;
+  }
+  .source-list .cite { vertical-align: 0; margin: 0; }
+
+  #viewer {
+    display: none; min-width: 0; width: min(48vw, 760px); flex-shrink: 0;
+    border-left: 1px solid var(--border); background: var(--panel);
+    flex-direction: column;
+  }
+  body.split #viewer { display: flex; }
+  body.split #chatpane { min-width: 360px; }
+  .viewer-head {
+    display: flex; align-items: center; gap: 8px; min-height: 48px;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+  }
+  .viewer-head .vt {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-size: 13px; font-weight: 600;
+  }
+  .viewer-head a, .viewer-head button {
+    border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    font-size: 13px; text-decoration: none; padding: 5px;
+  }
+  .viewer-head a:hover, .viewer-head button:hover { color: var(--accent); }
+  #viewer-frame { width: 100%; flex: 1; border: 0; background: var(--bg); }
+  .viewer-fallback { padding: 20px; color: var(--muted); line-height: 1.6; }
+  .viewer-fallback .snippet {
+    margin-top: 12px; padding: 12px; white-space: pre-wrap;
+    border-radius: 8px; background: var(--bg); color: var(--text);
+  }
+
+  @media (max-width: 900px) {
+    body.split #viewer {
+      position: fixed; inset: 0; z-index: 20; width: 100%; border-left: 0;
+    }
+  }
+
   footer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 0 18px; }
   .composer {
     max-width: 760px; margin: 0 auto; padding: 0 20px;
@@ -151,6 +198,16 @@
         <div class="hint">回答中的 [S编号] 对应真实检索来源。支持多轮追问（自动指代消解）。</div>
       </footer>
     </section>
+
+    <section id="viewer" aria-label="PDF 预览">
+      <div class="viewer-head">
+        <span class="vt" id="viewer-title">来源预览</span>
+        <a id="viewer-open" href="#" target="_blank" rel="noopener" title="在新标签页打开">新窗口</a>
+        <button id="viewer-close" type="button" title="关闭预览">关闭</button>
+      </div>
+      <iframe id="viewer-frame" title="PDF 预览"></iframe>
+      <div class="viewer-fallback" id="viewer-fallback" hidden></div>
+    </section>
   </div>
 
 <script>
@@ -158,6 +215,7 @@ const API = "";
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
 const sessionsEl = $("sessions");
+let previewRequestId = 0;
 
 // ---------- 会话存储（多会话，纯前端 localStorage） ----------
 const SESS_KEY = "rag_sessions";
@@ -256,13 +314,55 @@ function protectMath(text, store) {
   return text;
 }
 
-function buildAnswerHtml(text) {
+const SID_RE = /\[(S\s*\d+)\]/gi;
+const DOC_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5h6l4 4v9H3zM9 1.5v4h4M5.5 9h5M5.5 11.5h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+function escapeAttribute(s) {
+  return escapeHtml(String(s || "")).replace(/"/g, "&quot;");
+}
+
+function normalizeSourceId(value, index) {
+  const match = String(value || "").toUpperCase().match(/S\s*(\d+)/);
+  return match ? `S${match[1]}` : `S${index + 1}`;
+}
+
+function citationButton(id, src) {
+  const payload = encodeURIComponent(JSON.stringify(src));
+  const title = escapeAttribute(`${id} · ${src.paper_title || src.paper_id} · ${src.section || ""}`);
+  return `<button type="button" class="cite" data-src="${payload}" title="${title}" aria-label="预览来源 ${id}">${DOC_ICON}<span>${id}</span></button>`;
+}
+
+function normalizedSources(sources) {
+  return (sources || []).map((src, index) => ({
+    ...src,
+    id: normalizeSourceId(src.id, index),
+  }));
+}
+
+function buildAnswerHtml(text, sources) {
   let t = text || "";
+  const sourceMap = {};
+  normalizedSources(sources).forEach(src => { sourceMap[src.id] = src; });
+  t = t.replace(SID_RE, (match, id) => {
+    const normalizedId = id.toUpperCase().replace(/\s+/g, "");
+    return sourceMap[normalizedId]
+      ? citationButton(normalizedId, sourceMap[normalizedId])
+      : match;
+  });
   const math = [];
   t = protectMath(t, math);
   let html = marked.parse(t);
   html = html.replace(/@@MATH(\d+)@@/g, (m, i) => math[+i]);
   return html;
+}
+
+function buildSourceList(sources) {
+  const items = normalizedSources(sources);
+  if (!items.length) return null;
+  const container = document.createElement("div");
+  container.className = "source-list";
+  container.innerHTML = `<span>来源</span>${items.map(src => citationButton(src.id, src)).join("")}`;
+  return container;
 }
 
 function typesetMath() {
@@ -287,7 +387,9 @@ function render() {
       div.innerHTML = `<div class="role">你</div><div class="bubble"></div>`;
       div.querySelector(".bubble").textContent = m.content;
     } else {
-      div.innerHTML = `<div class="role">助手</div><div class="bubble">${buildAnswerHtml(m.content)}</div>`;
+      div.innerHTML = `<div class="role">助手</div><div class="bubble">${buildAnswerHtml(m.content, m.sources)}</div>`;
+      const sourceList = buildSourceList(m.sources);
+      if (sourceList) div.appendChild(sourceList);
       if (m.steps && m.steps.length) {
         const d = document.createElement("details");
         d.className = "steps";
@@ -309,7 +411,51 @@ function render() {
 }
 
 function escapeHtml(s) {
-  return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+// ---------- PDF 预览（与高光功能解耦） ----------
+function openPreview(src) {
+  document.body.classList.add("split");
+  $("viewer-title").textContent = (
+    `《${src.paper_title || src.paper_id || "来源"}》` +
+    (src.section ? ` · ${src.section}` : "")
+  );
+  const frame = $("viewer-frame");
+  const fallback = $("viewer-fallback");
+  const isPdf = String(src.source || "").toLowerCase().endsWith(".pdf");
+
+  if (!isPdf || !src.paper_id) {
+    frame.hidden = true;
+    frame.removeAttribute("src");
+    $("viewer-open").hidden = true;
+    fallback.hidden = false;
+    fallback.innerHTML = `<div>该来源没有可预览的本地 PDF。</div><div class="snippet"></div>`;
+    fallback.querySelector(".snippet").textContent = src.snippet || "(无来源片段)";
+    return;
+  }
+
+  const page = Math.max(1, Number(src.page_start) || 1);
+  const cleanPdfUrl = `${API}/papers/${encodeURIComponent(src.paper_id)}/pdf#page=${page}`;
+  // Native PDF viewers often ignore a hash-only change when S1/S3 point to the
+  // same file. A unique query value forces the iframe plugin to reopen the PDF
+  // and honor the new #page target without reintroducing text highlighting.
+  previewRequestId += 1;
+  const iframePdfUrl = (
+    `${API}/papers/${encodeURIComponent(src.paper_id)}/pdf` +
+    `?preview=${previewRequestId}#page=${page}`
+  );
+  fallback.hidden = true;
+  fallback.innerHTML = "";
+  frame.hidden = false;
+  frame.src = iframePdfUrl;
+  $("viewer-open").hidden = false;
+  $("viewer-open").href = cleanPdfUrl;
+}
+
+function closePreview() {
+  document.body.classList.remove("split");
+  $("viewer-frame").removeAttribute("src");
 }
 
 // 把一条结构化 trace 事件渲染成表格行：类型徽标 + 关键字段摘要
@@ -394,7 +540,7 @@ async function send() {
       const data = await r.json();
       s.messages.push({
         role: "assistant", content: data.answer || "(空回答)",
-        steps: data.steps || [], trace: data.trace || [],
+        sources: data.sources || [], steps: data.steps || [], trace: data.trace || [],
       });
     }
   } catch (e) {
@@ -412,6 +558,14 @@ function setSending(b) { $("send").disabled = b; }
 $("send").addEventListener("click", send);
 $("newchat").addEventListener("click", () => { newSession(); renderSessions(); render(); $("input").focus(); });
 $("toggle-sidebar").addEventListener("click", () => document.body.classList.toggle("nosidebar"));
+$("viewer-close").addEventListener("click", closePreview);
+messagesEl.addEventListener("click", e => {
+  const button = e.target.closest(".cite");
+  if (!button) return;
+  try {
+    openPreview(JSON.parse(decodeURIComponent(button.dataset.src)));
+  } catch (_) {}
+});
 
 const input = $("input");
 input.addEventListener("keydown", e => {

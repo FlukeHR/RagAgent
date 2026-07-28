@@ -8,6 +8,7 @@ from pathlib import Path
 from config.settings import BASE_DIR, Settings
 from indexing.build_index import build_index
 from indexing.prune import prune_library, touch_papers
+from retrieval.embedder import Embedder
 from retrieval.repository import (
     PaperRepository,
     arxiv_storage_id,
@@ -35,6 +36,7 @@ class PaperLibraryService:
         self.data_dir = BASE_DIR / settings.project.data_root
         self.index_dir = BASE_DIR / settings.index.index_root
         self.repository = PaperRepository(self.data_dir)
+        self.last_embedder: Embedder | None = None
 
     def ingest_arxiv(self, arxiv_ids: list[str]) -> IngestReport:
         normalized: list[str] = []
@@ -59,9 +61,19 @@ class PaperLibraryService:
 
             if report.downloaded or not (self.index_dir / "manifest.json").exists():
                 if any(self.repository.iter_files((".pdf",))):
+                    self.last_embedder = Embedder(
+                        self.settings.embedding.model_name,
+                        self.settings.embedding.use_sentence_transformers,
+                        self.settings.embedding.fallback_dimension,
+                    )
                     report.indexed_chunks = build_index(
                         self.settings,
                         incremental=True,
+                        embedder=self.last_embedder,
+                        build_image_index=(
+                            self.settings.image_search.enabled
+                            and self.settings.image_search.rebuild_on_ingest
+                        ),
                     )
             else:
                 from retrieval.vector_store import VectorStore
