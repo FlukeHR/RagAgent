@@ -1,41 +1,46 @@
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
-from typing import Literal
 
 
 class Turn(BaseModel):
-    """对话历史中的一轮（仅纯文本，不含工具内部块）。"""
+    """One plain-text conversation turn."""
 
     role: Literal["user", "assistant"]
-    content: str = Field(..., description="该轮文本内容")
+    content: str
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="用户问题")
+    question: str = Field(..., min_length=1)
     session_id: str | None = Field(
         None,
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z0-9_-]+$",
     )
-    history: list[Turn] = Field(
-        default_factory=list, description="本会话之前的对话轮次，用于历史注入与指代消解"
-    )
+    history: list[Turn] = Field(default_factory=list)
 
 
 class SourceItem(BaseModel):
-    id: str | None = None  # 引用编号，如 S1；前端按它把 [S1] 标记映射到本来源
+    id: str | None = None
     chunk_id: str | None = None
     paper_id: str
     paper_title: str
     section: str
-    source: str
+    source: str | None = Field(default=None, exclude=True)
+    source_kind: Literal["library_pdf", "external_url"] = "library_pdf"
+    citation_url: str | None = None
+    preview_kind: Literal["pdf", "web"] = "pdf"
     page_start: int | None = None
     page_end: int | None = None
     element_type: str | None = None
     modality: str | None = None
     bbox: tuple[float, float, float, float] | None = None
+    bbox_space: str | None = None
+    element_id: str | None = None
+    parser_metadata: dict[str, Any] = Field(default_factory=dict)
     chunk_context: str | None = None
     heading_path: str | None = None
     score: float | None = None
@@ -45,14 +50,11 @@ class SourceItem(BaseModel):
     sparse_score: float | None = None
     fusion_score: float | None = None
     lexical_anchor_score: float = 0.0
-    snippet: str | None = None  # 引用原文片段，供回答展示与生成侧评估使用
-    image_mime_type: str | None = None
-    image_width: int | None = None
-    image_height: int | None = None
-    image_base64: str | None = None
+    snippet: str | None = None
     published_at: str | None = None
     support_status: str | None = None
     quality_rank: int = 0
+    origin_tools: list[str] = Field(default_factory=list)
 
 
 class AskResponse(BaseModel):
@@ -60,21 +62,49 @@ class AskResponse(BaseModel):
     status: str = "answered"
     steps: list[str]
     sources: list[SourceItem]
-    trace: list[dict] = Field(default_factory=list)
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+    suggested_actions: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class IngestArxivRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="arXiv 检索关键词")
-    max_results: int | None = Field(None, ge=1, le=20, description="下载论文数量")
+class ArxivProposalRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000)
+    max_results: int | None = Field(None, ge=1, le=20)
 
 
-class IngestArxivResponse(BaseModel):
-    downloaded: list[str]
-    indexed_chunks: int
+class ArxivCandidate(BaseModel):
+    arxiv_id: str
+    title: str
+    authors: list[str]
+    summary: str
+    published: str | None = None
+    entry_url: str | None = None
+
+
+class ArxivProposalResponse(BaseModel):
+    proposal_id: str
+    expires_at: float
+    candidates: list[ArxivCandidate]
+
+
+class ConfirmIngestRequest(BaseModel):
+    proposal_id: str = Field(..., min_length=32, max_length=64, pattern=r"^[a-f0-9]+$")
+    arxiv_ids: list[str] = Field(..., min_length=1, max_length=1)
+
+
+class IngestJobResponse(BaseModel):
+    job_id: str
+    proposal_id: str
+    query: str
+    arxiv_ids: list[str]
+    status: Literal["queued", "parsing", "indexing", "succeeded", "failed"]
+    created_at: float
+    updated_at: float
+    error: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class TitleRequest(BaseModel):
-    messages: list[Turn] = Field(..., description="用于概括标题的对话轮次（通常是首轮问答）")
+    messages: list[Turn]
 
 
 class TitleResponse(BaseModel):
@@ -83,5 +113,95 @@ class TitleResponse(BaseModel):
 
 class ConversationResponse(BaseModel):
     session_id: str
-    state: dict
+    state: dict[str, Any]
     history: list[Turn]
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=8, max_length=256)
+    display_name: str = Field(default="", max_length=80)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=32)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=256)
+    new_password: str = Field(..., min_length=8, max_length=256)
+
+
+class AccountUpdateRequest(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=80)
+
+
+class AuthUser(BaseModel):
+    user_id: str
+    username: str
+    display_name: str
+
+
+class AuthResponse(BaseModel):
+    user: AuthUser
+    csrf_token: str
+    expires_at: float
+
+
+class ModelProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    provider: str = Field(default="openai-compatible", min_length=1, max_length=40)
+    api_base: str = Field(..., min_length=1, max_length=500)
+    model_name: str = Field(..., min_length=1, max_length=160)
+    api_key: str = Field(..., min_length=1, max_length=1000)
+    is_default: bool = False
+
+
+class ModelProfileUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    provider: str | None = Field(default=None, min_length=1, max_length=40)
+    api_base: str | None = Field(default=None, min_length=1, max_length=500)
+    model_name: str | None = Field(default=None, min_length=1, max_length=160)
+    api_key: str | None = Field(default=None, min_length=1, max_length=1000)
+    is_default: bool | None = None
+
+
+class ModelProfileResponse(BaseModel):
+    profile_id: str
+    name: str
+    provider: str
+    api_base: str
+    model_name: str
+    key_last4: str
+    is_default: bool
+    created_at: float
+    updated_at: float
+
+
+class SessionCreateRequest(BaseModel):
+    title: str = Field(default="新对话", max_length=80)
+    model_profile_id: str | None = Field(default=None, max_length=64)
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=80)
+    model_profile_id: str | None = Field(default=None, max_length=64)
+
+
+class SessionAskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=20000)
+
+
+class SessionImportItem(BaseModel):
+    title: str = Field(default="旧对话", max_length=80)
+    messages: list[Turn] = Field(default_factory=list, max_length=100)
+
+
+class SessionImportRequest(BaseModel):
+    sessions: list[SessionImportItem] = Field(default_factory=list, max_length=50)
+
+
+class ArxivConfirmRequest(BaseModel):
+    proposal_id: str = Field(..., min_length=32, max_length=64)
+    arxiv_id: str = Field(..., min_length=1, max_length=80)

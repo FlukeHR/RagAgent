@@ -1,0 +1,42 @@
+services:
+  mineru-api:
+    # Build or retag the official MinerU 3.4.x image to this exact local tag.
+    image: ${MINERU_IMAGE:-mineru:3.4.4}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_API_MAX_CONCURRENT_REQUESTS: "1"
+      MINERU_API_OUTPUT_ROOT: /data/output
+    entrypoint: mineru-api
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --enable-vlm-preload
+      - "true"
+    volumes:
+      - mineru-models:/root/.cache
+      - mineru-output:/data/output
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  mineru-models:
+  mineru-output:

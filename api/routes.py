@@ -8,11 +8,14 @@ from fastapi.responses import FileResponse
 
 from agent.graph import PaperRAGAgent
 from api.schemas import (
+    ArxivCandidate,
+    ArxivProposalRequest,
+    ArxivProposalResponse,
     AskRequest,
     AskResponse,
+    ConfirmIngestRequest,
     ConversationResponse,
-    IngestArxivRequest,
-    IngestArxivResponse,
+    IngestJobResponse,
     SourceItem,
     TitleRequest,
     TitleResponse,
@@ -20,8 +23,10 @@ from api.schemas import (
 )
 from config.settings import BASE_DIR, load_settings
 from llm.model import LLMClient
-from retrieval.repository import InvalidPaperId, PaperRepository
-from services import ArxivSearchService, PaperLibraryService
+from retrieval.documents import InvalidPaperId, PaperRepository
+from services import ArxivSearchService
+from services.ingest_jobs import IngestJobManager, IngestJobStore, job_to_dict
+
 
 router = APIRouter()
 
@@ -31,36 +36,108 @@ def _get_agent() -> PaperRAGAgent:
     return PaperRAGAgent(settings=load_settings())
 
 
+@lru_cache(maxsize=1)
+def _get_ingest_manager() -> IngestJobManager:
+    return IngestJobManager(load_settings())
+
+
+@router.post("/arxiv/ingest/proposals", response_model=ArxivProposalResponse)
+def create_ingest_proposal(req: ArxivProposalRequest) -> ArxivProposalResponse:
+    """Search candidates and create a short-lived, non-writing proposal."""
+
+    settings = load_settings()
+    try:
+        papers = ArxivSearchService(settings).search(req.query, req.max_results)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"arXiv search failed: {exc}") from exc
+    if not papers:
+        raise HTTPException(status_code=404, detail="No matching arXiv papers found")
+    proposal = IngestJobStore(settings).create_proposal(
+        req.query, [paper.arxiv_id for paper in papers]
+    )
+    return ArxivProposalResponse(
+        proposal_id=proposal.proposal_id,
+        expires_at=proposal.expires_at,
+        candidates=[
+            ArxivCandidate(
+                arxiv_id=paper.arxiv_id,
+                title=paper.title,
+                authors=list(paper.authors),
+                summary=paper.summary,
+                published=paper.published.isoformat() if paper.published else None,
+            )
+            for paper in papers
+        ],
+    )
+
+
+@router.post(
+    "/arxiv/ingest/confirm", response_model=IngestJobResponse, status_code=202
+)
+def confirm_ingest(req: ConfirmIngestRequest) -> IngestJobResponse:
+    """Consume one proposal and queue a scoped asynchronous write job."""
+
+    try:
+        job = _get_ingest_manager().confirm(req.proposal_id, req.arxiv_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return IngestJobResponse.model_validate(job_to_dict(job))
+
+
+@router.get("/arxiv/ingest/jobs/{job_id}", response_model=IngestJobResponse)
+def get_ingest_job(job_id: str) -> IngestJobResponse:
+    job = _get_ingest_manager().store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown ingest job")
+    return IngestJobResponse.model_validate(job_to_dict(job))
+
+
+@router.post(
+    "/arxiv/ingest/jobs/{job_id}/retry",
+    response_model=IngestJobResponse,
+    status_code=202,
+)
+def retry_ingest_job(job_id: str) -> IngestJobResponse:
+    try:
+        job = _get_ingest_manager().retry(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return IngestJobResponse.model_validate(job_to_dict(job))
+
+
 @router.get("/papers/{paper_id}/pdf", response_class=FileResponse)
 def preview_pdf(paper_id: str) -> FileResponse:
-    """Serve one repository PDF inline for the browser's native previewer."""
+    """Serve one validated repository PDF for the browser previewer."""
 
     settings = load_settings()
     repository = PaperRepository(BASE_DIR / settings.project.data_root)
     try:
         pdf_path = repository.resolve(paper_id, (".pdf",))
     except InvalidPaperId as exc:
-        raise HTTPException(status_code=400, detail="无效的论文标识") from exc
+        raise HTTPException(status_code=400, detail="Invalid paper identifier") from exc
     if pdf_path is None:
-        raise HTTPException(status_code=404, detail=f"无 PDF 可预览: {paper_id}")
+        raise HTTPException(status_code=404, detail=f"PDF not found: {paper_id}")
     return FileResponse(path=pdf_path, media_type="application/pdf")
 
 
 @router.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     try:
-        agent = _get_agent()
-        history = [turn.model_dump() for turn in req.history]
-        result = agent.ask(
+        result = _get_agent().ask(
             req.question,
-            history=history,
+            history=[turn.model_dump() for turn in req.history],
             session_id=req.session_id,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"内部错误: {exc}") from exc
-
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Internal error: {exc}") from exc
     return AskResponse(
         answer=result.answer,
         status=result.status,
@@ -71,88 +148,46 @@ def ask(req: AskRequest) -> AskResponse:
 
 
 def _truncate_title(text: str, limit: int = 20) -> str:
-    """降级标题：取首条用户消息首行前 limit 字。"""
     line = re.sub(r"\s+", " ", (text or "").strip())
     if not line:
-        return "新对话"
+        return "New conversation"
     return line[:limit] + ("…" if len(line) > limit else "")
 
 
 @router.post("/title", response_model=TitleResponse)
 def make_title(req: TitleRequest) -> TitleResponse:
-    """生成简短会话标题；模型不可用时截断首条用户消息。"""
     first_user = next(
-        (message.content for message in req.messages if message.role == "user"),
-        "",
+        (message.content for message in req.messages if message.role == "user"), ""
     )
     llm = LLMClient(load_settings().llm)
     if not llm.supports_agentic():
         return TitleResponse(title=_truncate_title(first_user))
-
     conversation = "\n".join(
-        f"{message.role}: {message.content[:500]}"
-        for message in req.messages[:4]
+        f"{message.role}: {message.content[:500]}" for message in req.messages[:4]
     )
     prompt = (
-        "请用不超过 12 个汉字概括下面这轮对话的主题，作为对话列表里的标题。"
-        "只输出标题本身，不要标点、不要引号、不要解释。\n\n"
-        f"对话：\n{conversation}\n\n标题："
+        "Create a concise conversation title of at most 12 Chinese characters or "
+        "eight English words. Output only the title.\n\n"
+        f"Conversation:\n{conversation}\n\nTitle:"
     )
-    try:
-        output = llm.generate(
-            prompt,
-            system="你是对话标题生成助手，只输出简短标题。",
-        )
-        title = re.sub(
-            r"\s+", " ", (output or "").strip().strip("\"'「」“”。.")
-        ).strip()
-        if (
-            not title
-            or len(title) > 30
-            or "降级模式" in title
-            or "调用失败" in title
-        ):
-            title = _truncate_title(first_user)
-    except Exception:  # noqa: BLE001
+    output = llm.generate(prompt, system="Return only a concise conversation title.")
+    title = re.sub(r"\s+", " ", (output or "").strip().strip("\"'"))
+    if not title or len(title) > 40 or "降級" in title:
         title = _truncate_title(first_user)
     return TitleResponse(title=title)
 
 
-@router.post("/ingest_arxiv", response_model=IngestArxivResponse)
-def ingest_arxiv(req: IngestArxivRequest) -> IngestArxivResponse:
-    """下载 arXiv PDF 到统一论文库并增量重建索引。"""
-    settings = load_settings()
-    try:
-        papers = ArxivSearchService(settings).search(
-            req.query,
-            max_results=req.max_results,
-        )
-        arxiv_ids = [paper.arxiv_id for paper in papers]
-        arxiv_ids = arxiv_ids[: settings.arxiv.max_ingest_papers]
-        if not arxiv_ids:
-            raise HTTPException(
-                status_code=404,
-                detail="arXiv 未检索到可下载论文",
-            )
+@router.post("/ingest_arxiv", include_in_schema=False)
+def ingest_arxiv(req: ArxivProposalRequest) -> None:
+    """Reject the removed one-step write endpoint."""
 
-        report = PaperLibraryService(settings).ingest_arxiv(arxiv_ids)
-        downloaded = [*report.downloaded, *report.reused]
-        if not downloaded:
-            raise HTTPException(
-                status_code=502,
-                detail="arXiv 论文下载失败",
-            )
-
-        indexed_chunks = report.indexed_chunks
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"入库失败: {exc}") from exc
-
-    _get_agent.cache_clear()
-    return IngestArxivResponse(
-        downloaded=downloaded,
-        indexed_chunks=indexed_chunks,
+    del req
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Direct ingestion was removed. Create a proposal and explicitly confirm "
+            "the selected arXiv ID."
+        ),
     )
 
 

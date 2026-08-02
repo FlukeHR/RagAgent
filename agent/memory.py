@@ -1,24 +1,119 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.conversation import ConversationState
 from config.settings import BASE_DIR, Settings
+
+
+@dataclass
+class ConversationState:
+    goal: str = ""
+    constraints: list[str] = field(default_factory=list)
+    facts: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    cited_papers: list[str] = field(default_factory=list)
+    summary: str = ""
+
+    @classmethod
+    def from_dict(cls, value: dict | None) -> "ConversationState":
+        fields = cls.__dataclass_fields__
+        data = {key: item for key, item in (value or {}).items() if key in fields}
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class PreparedConversation:
+    history: list[dict]
+    summary: str
+    dropped_messages: int
+
+
+class ConversationManager:
+    """Bound and summarize conversation history without classifying intent."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def prepare(self, history: list[dict]) -> PreparedConversation:
+        valid = [
+            {"role": item.get("role"), "content": str(item.get("content") or "")}
+            for item in history
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
+        message_limit = self.settings.agent.history_max_messages
+        recent_limit = min(message_limit, self.settings.agent.recent_history_messages)
+        recent = valid[-recent_limit:]
+        summary = self._summarize(valid[:-recent_limit])
+        budget = self.settings.agent.history_max_chars
+        bounded: list[dict] = []
+        used = len(summary)
+        for item in reversed(recent):
+            remaining = budget - used
+            if remaining <= 0:
+                break
+            content = str(item.get("content") or "")[:remaining]
+            bounded.append({"role": item["role"], "content": content})
+            used += len(content)
+        bounded.reverse()
+        if summary:
+            bounded.insert(
+                0,
+                {
+                    "role": "assistant",
+                    "content": f"[较早对话的系统摘要]\n{summary}",
+                },
+            )
+        return PreparedConversation(
+            history=bounded,
+            summary=summary,
+            dropped_messages=max(0, len(valid) - len(recent)),
+        )
+
+    def update_state(
+        self,
+        state: ConversationState,
+        sources: list[dict],
+        summary: str,
+        planned_goal: str,
+    ) -> ConversationState:
+        """Persist the goal selected by the semantic planner and cited papers."""
+
+        if planned_goal:
+            state.goal = planned_goal[:500]
+        state.summary = summary
+        for source in sources:
+            paper_id = source.get("paper_id")
+            if paper_id and paper_id not in state.cited_papers:
+                state.cited_papers.append(paper_id)
+        state.cited_papers = state.cited_papers[-50:]
+        return state
+
+    def _summarize(self, messages: list[dict]) -> str:
+        if not messages:
+            return ""
+        lines = []
+        for item in messages:
+            role = "用户" if item["role"] == "user" else "助手"
+            content = re.sub(r"\s+", " ", item["content"]).strip()
+            lines.append(f"{role}: {content[:300]}")
+        return "\n".join(lines)[-self.settings.agent.history_summary_max_chars :]
 
 
 class ConversationMemory:
     """Bounded SQLite server-side conversation memory with TTL and deletion."""
 
     def __init__(self, settings: Settings) -> None:
-        configured = Path(settings.harness.memory_db_path)
+        configured = Path(settings.agent.memory_db_path)
         self.path = configured if configured.is_absolute() else BASE_DIR / configured
-        self.ttl = settings.harness.memory_ttl_seconds
-        self.max_sessions = settings.harness.memory_max_sessions
+        self.ttl = settings.agent.memory_ttl_seconds
+        self.max_sessions = settings.agent.memory_max_sessions
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()

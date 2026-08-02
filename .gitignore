@@ -13,19 +13,18 @@ venv/
 
 # Runtime index artifacts
 /data/indexes/**
+/data/mineru-cache/**
 /data/*.sqlite3*
-
-# 评估数据集（QASPER 等，体积大，本地下载不入库）
-/evaluation/data/**
-!/evaluation/data/qasper/README.md
-!/evaluation/data/pdf_grounding/
-!/evaluation/data/pdf_grounding/*.json
-!/evaluation/data/business_cases.jsonl
-!/evaluation/data/badcases.jsonl
-/evaluation/results/**
+/data/users/**
+/data/secrets/**
 
 # Local logs
 *.log
+
+# Frontend build/cache
+/frontend/web/node_modules/
+/frontend/web/dist/
+/frontend/web/.npm-cache/
 
 # 本地模型副本（体积大、可复现：缺失时代码自动回退 HF 在线下载）
 /models/**

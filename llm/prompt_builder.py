@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from retrieval.retriever import RetrievalResult
+from retrieval.search import RetrievalResult
 
 
 def build_generation_prompt(question: str, contexts: list[RetrievalResult]) -> str:

@@ -1,75 +1,58 @@
 from __future__ import annotations
 
+import json
+
 from config.settings import BASE_DIR, Settings
-from retrieval.retriever import Retriever
-from tools.base import EvidenceSource, ToolPolicy, ToolResult
+from retrieval.search import Retriever
+from tools.base import EvidenceSource, ToolResult
 
 
 class PaperSearchTool:
-    """本地论文库语义检索工具。"""
+    """Search canonical local paper chunks and return copyable locators."""
 
     name = "search_local_papers"
-    policy = ToolPolicy(side_effects="read", idempotent=True)
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         index_dir = BASE_DIR / settings.index.index_root
         self.retriever = Retriever(settings=settings, index_dir=str(index_dir))
 
-    @staticmethod
-    def schema() -> dict:
-        return {
-            "name": "search_local_papers",
-            "description": (
-                "在本地论文库中做语义检索，返回最相关的论文片段（含论文标题与所属章节）。"
-                "当用户的问题可能由已收录论文回答时，优先使用本工具。"
-            ),
-            "input_schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 1000,
-                        "description": "检索查询，可用关键词或自然语言问题",
-                    }
-                },
-                "required": ["query"],
-            },
-        }
-
     def run(self, query: str) -> ToolResult:
         results = self.retriever.search(query)
         if not results:
-            return ToolResult(text="本地论文库未检索到相关片段。", sources=[])
+            return ToolResult(text="No relevant local paper evidence was retrieved.")
 
         blocks: list[str] = []
         sources: list[EvidenceSource] = []
-        for i, r in enumerate(results, start=1):
-            c = r.chunk
-            cite = f"{{{{cite:{i - 1}}}}}"
-            page_label = (
-                f"｜页码 {c.page_start}" if c.page_start == c.page_end and c.page_start is not None
-                else f"｜页码 {c.page_start}-{c.page_end}" if c.page_start is not None and c.page_end is not None
-                else ""
-            )
+        for index, result in enumerate(results):
+            chunk = result.chunk
+            locator: dict[str, object]
+            if chunk.element_id:
+                locator = {"kind": "element", "element_id": chunk.element_id}
+            elif chunk.granularity == "page" and chunk.page_start == chunk.page_end:
+                locator = {"kind": "page", "page_number": chunk.page_start}
+            else:
+                locator = {"kind": "section", "section": chunk.section}
+            inspect_args = {"paper_id": chunk.paper_id, "locator": locator}
             blocks.append(
-                f"{cite}《{c.paper_title}》｜章节 {c.section}{page_label}｜类型 {c.element_type}｜模态 {c.modality}｜论文ID {c.paper_id}"
-                f"\n上下文：{c.chunk_context or c.section}"
-                f"（论文ID 仅供 read_paper_section 调用）\n{c.content}"
+                f"{{{{cite:{index}}}}} Untrusted paper evidence.\n"
+                f"paper_id={chunk.paper_id} | title={chunk.paper_title} | "
+                f"section={chunk.section} | pages={chunk.page_start}-{chunk.page_end} | "
+                f"type={chunk.element_type} | modality={chunk.modality}\n"
+                f"inspect_paper_args={json.dumps(inspect_args, ensure_ascii=False)}\n"
+                f"{chunk.content}"
             )
             sources.append(
                 EvidenceSource.from_chunk(
-                    c,
-                    score=r.score,
-                    snippet_chars=self.settings.harness.source_snippet_chars,
-                    confidence=r.confidence,
-                    score_backend=r.backend,
-                    dense_score=r.dense_score,
-                    sparse_score=r.sparse_score,
-                    fusion_score=r.fusion_score,
-                    lexical_anchor_score=r.lexical_anchor_score,
+                    chunk,
+                    score=result.score,
+                    snippet_chars=self.settings.agent.source_snippet_chars,
+                    confidence=result.confidence,
+                    score_backend=result.backend,
+                    dense_score=result.dense_score,
+                    sparse_score=result.sparse_score,
+                    fusion_score=result.fusion_score,
+                    lexical_anchor_score=result.lexical_anchor_score,
                 )
             )
         return ToolResult(

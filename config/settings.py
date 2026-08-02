@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -50,29 +50,36 @@ class RetrievalConfig:
     cjk_ngram_size: int = 2
     deduplicate_evidence: bool = True
     conflict_detection: bool = True
+    claim_support_min_overlap: float = 0.12
 
 
 @dataclass
-class PDFParseConfig:
-    provider: str = "pymupdf"
-    auto_ocr: bool = False
-    timeout_seconds: float = 30.0
-
-
-@dataclass
-class ImageSearchConfig:
-    enabled: bool = True
-    max_pages: int = 80
-    max_side: int = 256
-    max_query_base64_chars: int = 2_000_000
-    rebuild_on_ingest: bool = False
+class MinerUConfig:
+    api_base_url: str = "http://127.0.0.1:8001"
+    version: str = "3.4.4"
+    backend: str = "hybrid-engine"
+    effort: str = "high"
+    supported_version_prefix: str = "3.4."
+    connect_timeout_seconds: float = 5.0
+    request_timeout_seconds: float = 30.0
+    max_request_retries: int = 2
+    parse_timeout_seconds: float = 900.0
+    poll_interval_seconds: float = 2.0
+    max_pdf_mb: float = 30.0
+    max_pages: int = 300
+    max_output_mb: float = 250.0
+    max_archive_entries: int = 3000
+    cache_root: str = "./data/mineru-cache"
+    proposal_ttl_seconds: int = 900
+    job_db_path: str = "./data/ingest_jobs.sqlite3"
+    max_pending_jobs: int = 8
+    max_concurrent_jobs: int = 1
 
 
 @dataclass
 class LLMConfig:
     model_name: str
     max_tokens: int
-    max_tool_iters: int
     openai_api_base: str
     openai_api_key: str
     request_timeout_seconds: float = 120.0
@@ -83,44 +90,58 @@ class LLMConfig:
 @dataclass
 class ArxivConfig:
     max_results: int
-    max_ingest_papers: int = 3            # ingest_arxiv_papers 每轮下载上限（有界，护栏 #2）
+    max_ingest_papers: int = 1            # 每个已确认 job 最多一篇论文
     max_pdf_mb: float = 30.0              # 单篇 PDF 体积上限，超出跳过
-    ingest_timeout_seconds: float = 120.0  # 下载+增量嵌入+重检索专属超时（含网络/推理）
     max_papers: int = 200                 # 在线入库论文容量上限；手动论文不自动淘汰；0 = 不限
     max_age_days: int = 0                 # 超过这么多天未被检索命中即淘汰；0 = 不按龄期淘汰
     request_timeout_seconds: float = 60.0
-    use_cross_encoder_after_ingest: bool = False
 
 
 @dataclass
-class HarnessConfig:
-    tool_timeout_seconds: float
-    tool_max_retries: int
+class AgentConfig:
+    """Bounded LangChain runtime, conversation, and evidence settings."""
+
     token_budget: int
-    tool_result_max_chars: int = 24000
+    tool_result_max_chars: int = 10000
     source_snippet_chars: int = 600
-    image_base64_chars: int = 12000
     history_max_messages: int = 12
     history_max_chars: int = 12000
     history_summary_max_chars: int = 2000
-    context_max_chars: int = 60000
-    clarification_enabled: bool = True
     memory_ttl_seconds: int = 604800
     memory_max_sessions: int = 500
     memory_db_path: str = "./data/sessions.sqlite3"
-    clarification_min_chars: int = 6
     recent_history_messages: int = 8
-    claim_support_min_overlap: float = 0.12
-    pdf_page_max_side: int = 2400
-    pdf_region_max_side: int = 1600
+    max_model_calls: int = 5
+    max_graph_steps: int = 128
+    max_tool_calls: int = 6
+    max_local_search_calls: int = 2
+    max_inspect_calls: int = 2
+    max_arxiv_search_calls: int = 2
+    max_total_sources: int = 10
+    max_total_tool_result_chars: int = 24000
+    final_max_sources: int = 5
+    final_max_sources_per_paper: int = 2
+    final_reuse_max_chars: int = 600
+    trace_value_max_chars: int = 500
 
 
 @dataclass
-class EvaluationConfig:
-    """只用于离线评测的价格参数；默认 0 表示只统计 token、不换算费用。"""
+class AppConfig:
+    """Local multi-user application storage, authentication, and quota settings."""
 
-    input_price_per_million: float = 0.0
-    output_price_per_million: float = 0.0
+    database_path: str = "./data/app.sqlite3"
+    users_root: str = "./data/users"
+    secrets_root: str = "./data/secrets"
+    session_cookie_name: str = "paper_rag_session"
+    session_ttl_seconds: int = 604800
+    password_min_length: int = 10
+    max_login_failures: int = 5
+    login_lock_seconds: int = 900
+    max_papers_per_user: int = 200
+    max_pending_jobs_per_user: int = 3
+    max_model_profiles_per_user: int = 10
+    enforce_public_dns_for_model_endpoints: bool = False
+    allowed_local_llm_endpoints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,12 +151,11 @@ class Settings:
     embedding: EmbeddingConfig
     rerank: RerankConfig
     retrieval: RetrievalConfig
-    pdf_parse: PDFParseConfig
-    image_search: ImageSearchConfig
+    mineru: MinerUConfig
     llm: LLMConfig
     arxiv: ArxivConfig
-    harness: HarnessConfig
-    evaluation: EvaluationConfig
+    agent: AgentConfig
+    app: AppConfig
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -170,12 +190,11 @@ def load_settings(path: str | Path | None = None) -> Settings:
         embedding=EmbeddingConfig(**raw["embedding"]),
         rerank=RerankConfig(**raw["rerank"]),
         retrieval=RetrievalConfig(**raw["retrieval"]),
-        pdf_parse=PDFParseConfig(**raw.get("pdf_parse", {})),
-        image_search=ImageSearchConfig(**raw.get("image_search", {})),
+        mineru=MinerUConfig(**raw.get("mineru", {})),
         llm=LLMConfig(**raw["llm"]),
         arxiv=ArxivConfig(**raw["arxiv"]),
-        harness=HarnessConfig(**raw["harness"]),
-        evaluation=EvaluationConfig(**raw.get("evaluation", {})),
+        agent=AgentConfig(**raw["agent"]),
+        app=AppConfig(**raw.get("app", {})),
     )
     _validate_settings(settings)
     return settings
@@ -192,8 +211,12 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError("index top-k values must be positive")
     if settings.index.top_n_rerank > settings.index.top_k_recall:
         raise ValueError("index.top_n_rerank cannot exceed top_k_recall")
-    if settings.llm.max_tool_iters <= 0 or settings.harness.token_budget <= 0:
-        raise ValueError("LLM iteration and token budgets must be positive")
+    if (
+        settings.agent.max_model_calls <= 0
+        or settings.agent.max_graph_steps <= 0
+        or settings.agent.token_budget <= 0
+    ):
+        raise ValueError("agent model-call and token budgets must be positive")
     if (
         settings.llm.request_timeout_seconds <= 0
         or settings.llm.connect_timeout_seconds <= 0
@@ -203,25 +226,60 @@ def _validate_settings(settings: Settings) -> None:
     for name in (
         "tool_result_max_chars",
         "source_snippet_chars",
-        "image_base64_chars",
         "history_max_messages",
         "history_max_chars",
-        "context_max_chars",
         "recent_history_messages",
-        "pdf_page_max_side",
-        "pdf_region_max_side",
     ):
-        if getattr(settings.harness, name) <= 0:
-            raise ValueError(f"harness.{name} must be positive")
+        if getattr(settings.agent, name) <= 0:
+            raise ValueError(f"agent.{name} must be positive")
     if settings.arxiv.max_ingest_papers <= 0 or settings.arxiv.max_pdf_mb <= 0:
         raise ValueError("arxiv ingest limits must be positive")
     if settings.arxiv.request_timeout_seconds <= 0:
         raise ValueError("arxiv.request_timeout_seconds must be positive")
     if settings.embedding.fallback_dimension <= 0:
         raise ValueError("embedding.fallback_dimension must be positive")
-    if settings.image_search.max_query_base64_chars <= 0:
-        raise ValueError("image_search.max_query_base64_chars must be positive")
-    if not 0.0 <= settings.harness.claim_support_min_overlap <= 1.0:
-        raise ValueError("harness.claim_support_min_overlap must be in [0, 1]")
+    if settings.mineru.backend != "hybrid-engine" or settings.mineru.effort != "high":
+        raise ValueError("MinerU baseline must use hybrid-engine with high effort")
+    if not settings.mineru.version.startswith(settings.mineru.supported_version_prefix):
+        raise ValueError("MinerU version must match supported_version_prefix")
+    if settings.mineru.max_pages <= 0 or settings.mineru.max_pdf_mb <= 0:
+        raise ValueError("MinerU PDF limits must be positive")
+    if settings.mineru.max_request_retries < 0:
+        raise ValueError("MinerU request retries cannot be negative")
+    if settings.mineru.max_concurrent_jobs != 1:
+        raise ValueError("MinerU ingestion must use one bounded worker")
+    for name in (
+        "max_tool_calls",
+        "max_local_search_calls",
+        "max_inspect_calls",
+        "max_arxiv_search_calls",
+        "max_total_sources",
+        "max_total_tool_result_chars",
+        "final_max_sources",
+        "final_max_sources_per_paper",
+        "final_reuse_max_chars",
+        "trace_value_max_chars",
+    ):
+        if getattr(settings.agent, name) <= 0:
+            raise ValueError(f"agent.{name} must be positive")
+    if settings.agent.final_max_sources_per_paper > settings.agent.final_max_sources:
+        raise ValueError(
+            "agent.final_max_sources_per_paper cannot exceed final_max_sources"
+        )
+    if not 0.0 <= settings.retrieval.claim_support_min_overlap <= 1.0:
+        raise ValueError("retrieval.claim_support_min_overlap must be in [0, 1]")
     if not 0.0 <= settings.retrieval.answerability_min_confidence <= 1.0:
         raise ValueError("retrieval.answerability_min_confidence must be in [0, 1]")
+    if settings.app.session_ttl_seconds <= 0:
+        raise ValueError("app.session_ttl_seconds must be positive")
+    if settings.app.password_min_length < 8:
+        raise ValueError("app.password_min_length must be at least 8")
+    for name in (
+        "max_login_failures",
+        "login_lock_seconds",
+        "max_papers_per_user",
+        "max_pending_jobs_per_user",
+        "max_model_profiles_per_user",
+    ):
+        if getattr(settings.app, name) <= 0:
+            raise ValueError(f"app.{name} must be positive")

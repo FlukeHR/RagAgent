@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from typing import Protocol
 
-from retrieval.models import PaperDocument
+from retrieval.documents import PaperDocument
 
 
 def content_hash(text: str) -> str:
@@ -30,6 +31,9 @@ class Chunk:
     parent_id: str | None = None
     content_hash: str = ""
     granularity: str = "section"
+    element_id: str | None = None
+    bbox_space: str | None = None
+    parser_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.content_hash:
@@ -71,6 +75,7 @@ class SectionChunkStrategy:
                         heading_path=section.heading_path or section.title,
                         parent_id=f"{document.paper_id}::section::{section.title}",
                         granularity="section",
+                        parser_metadata=document.parser_metadata,
                     )
                 )
                 index += 1
@@ -126,6 +131,7 @@ class PageChunkStrategy:
                         parent_id=parent,
                         content_hash=digest,
                         granularity="page",
+                        parser_metadata=document.parser_metadata,
                     )
                 )
         return chunks
@@ -135,7 +141,9 @@ class ElementChunkStrategy:
     def build(self, document: PaperDocument, chunker: "PaperChunker") -> list[Chunk]:
         chunks: list[Chunk] = []
         for element in document.elements:
-            section = chunker.element_section(element.element_type, element.page_start)
+            section = element.heading_path or chunker.element_section(
+                element.element_type, element.page_start
+            )
             chunks.append(
                 Chunk(
                     chunk_id=(
@@ -159,9 +167,12 @@ class ElementChunkStrategy:
                         element.element_type,
                         element.modality,
                     ),
-                    heading_path=section,
+                    heading_path=element.heading_path or section,
                     parent_id=f"{document.paper_id}::page::{element.page_start}",
                     granularity="element",
+                    element_id=element.element_id,
+                    bbox_space="normalized_1000" if element.bbox else None,
+                    parser_metadata=document.parser_metadata,
                 )
             )
         return chunks
@@ -198,23 +209,6 @@ class PaperChunker:
                     seen.add(key)
                     chunks.append(chunk)
         return chunks
-
-    # Compatibility entry points used by external callers.
-    def split(self, documents: list[PaperDocument]) -> list[Chunk]:
-        return self._build_with(SectionChunkStrategy(), documents)
-
-    def split_pages(self, documents: list[PaperDocument]) -> list[Chunk]:
-        return self._build_with(PageChunkStrategy(), documents)
-
-    def split_elements(self, documents: list[PaperDocument]) -> list[Chunk]:
-        return self._build_with(ElementChunkStrategy(), documents)
-
-    def _build_with(
-        self,
-        strategy: ChunkStrategy,
-        documents: list[PaperDocument],
-    ) -> list[Chunk]:
-        return [chunk for document in documents for chunk in strategy.build(document, self)]
 
     @staticmethod
     def context(

@@ -2,18 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass, field
-from typing import Any, Protocol, runtime_checkable
-
-
-@dataclass(frozen=True)
-class ToolPolicy:
-    """Execution policy enforced by the harness, not by the model."""
-
-    timeout_seconds: float | None = None
-    max_retries: int | None = None
-    side_effects: str = "read"  # read | network | write
-    idempotent: bool = True
-    isolate_process: bool = False
+from typing import Any
 
 
 @dataclass
@@ -30,6 +19,9 @@ class EvidenceSource:
     element_type: str | None = None
     modality: str | None = None
     bbox: tuple[float, float, float, float] | None = None
+    bbox_space: str | None = None
+    element_id: str | None = None
+    parser_metadata: dict[str, Any] = field(default_factory=dict)
     chunk_context: str | None = None
     heading_path: str | None = None
     score: float | None = None
@@ -40,13 +32,10 @@ class EvidenceSource:
     fusion_score: float | None = None
     lexical_anchor_score: float = 0.0
     snippet: str | None = None
-    image_mime_type: str | None = None
-    image_width: int | None = None
-    image_height: int | None = None
-    image_base64: str | None = None
     published_at: str | None = None
     support_status: str | None = None
     quality_rank: int = 0
+    origin_tools: list[str] = field(default_factory=list)
     citation_id: str | None = None
 
     @property
@@ -91,6 +80,9 @@ class EvidenceSource:
             element_type=chunk.element_type,
             modality=chunk.modality,
             bbox=chunk.bbox,
+            bbox_space=getattr(chunk, "bbox_space", None),
+            element_id=getattr(chunk, "element_id", None),
+            parser_metadata=getattr(chunk, "parser_metadata", {}),
             chunk_context=chunk.chunk_context,
             heading_path=chunk.heading_path,
             score=round(float(score), 4) if score is not None else None,
@@ -118,68 +110,3 @@ class ToolResult:
     text: str
     sources: list[EvidenceSource] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@runtime_checkable
-class Tool(Protocol):
-    name: str
-    policy: ToolPolicy
-
-    def schema(self) -> dict[str, Any]: ...
-
-    def run(self, **kwargs: Any) -> ToolResult: ...
-
-
-@dataclass(frozen=True)
-class ToolSpec:
-    name: str
-    schema: dict[str, Any]
-    policy: ToolPolicy
-    handler: Any
-
-    @classmethod
-    def from_tool(cls, tool: Any) -> "ToolSpec":
-        return cls(tool.name, tool.schema(), tool.policy, tool)
-
-
-class ToolRegistry:
-    """Single source of truth for tool instances, schemas and execution policies."""
-
-    def __init__(self, tools: list[Any] | None = None) -> None:
-        self._specs: dict[str, ToolSpec] = {}
-        for tool in tools or []:
-            self.register(tool)
-
-    def register(self, tool: Any) -> None:
-        spec = ToolSpec.from_tool(tool)
-        if spec.name in self._specs:
-            raise ValueError(f"duplicate tool: {spec.name}")
-        if spec.schema.get("name") != spec.name:
-            raise ValueError(f"tool/schema name mismatch: {spec.name}")
-        self._specs[spec.name] = spec
-
-    def get(self, name: str) -> ToolSpec | None:
-        return self._specs.get(name)
-
-    def schemas(self, allowed: set[str] | None = None) -> list[dict[str, Any]]:
-        return [
-            spec.schema
-            for name, spec in self._specs.items()
-            if allowed is None or name in allowed
-        ]
-
-    def names(self) -> set[str]:
-        return set(self._specs)
-
-    def profile_schemas(self, profile: str) -> list[dict[str, Any]]:
-        """Progressively expose schemas without turning tools into opaque skills."""
-
-        profiles = {
-            "local": {"search_local_papers", "read_paper_section"},
-            "pdf": {"read_pdf_page", "read_pdf_region", "search_pdf_images"},
-            "arxiv": {"search_arxiv", "ingest_arxiv_papers"},
-            "all": self.names(),
-        }
-        if profile not in profiles:
-            raise ValueError(f"unknown tool profile: {profile}")
-        return self.schemas(profiles[profile])

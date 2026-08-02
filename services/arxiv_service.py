@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 from xml.etree import ElementTree
 
 from config.settings import Settings
-from retrieval.repository import normalize_arxiv_id
+from retrieval.documents import normalize_arxiv_id
 
 
 @dataclass(frozen=True)
@@ -32,11 +32,12 @@ class ArxivSearchService:
         import requests
 
         count = min(max_results or self.default_max_results, self.default_max_results)
+        candidate_count = max(count, min(20, count * 4))
         params = urlencode(
             {
                 "search_query": f"all:{query.strip()}",
                 "start": 0,
-                "max_results": count,
+                "max_results": candidate_count,
                 "sortBy": "relevance",
             }
         )
@@ -46,7 +47,14 @@ class ArxivSearchService:
             headers={"User-Agent": "paper-rag-agent/1.0"},
         )
         response.raise_for_status()
-        return self._parse(response.content)[:count]
+        papers = self._parse(response.content)
+        papers.sort(
+            key=lambda paper: (
+                paper.published.timestamp() if paper.published else float("-inf")
+            ),
+            reverse=True,
+        )
+        return papers[:count]
 
     @staticmethod
     def _parse(payload: bytes) -> list[ArxivPaper]:
@@ -55,6 +63,8 @@ class ArxivSearchService:
         papers: list[ArxivPaper] = []
         for entry in root.findall("atom:entry", ns):
             entry_url = (entry.findtext("atom:id", default="", namespaces=ns) or "").strip()
+            if entry_url.startswith("http://arxiv.org/"):
+                entry_url = "https://arxiv.org/" + entry_url.removeprefix("http://arxiv.org/")
             raw_id = (
                 entry_url.split("/abs/", 1)[1]
                 if "/abs/" in entry_url

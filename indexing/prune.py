@@ -148,10 +148,6 @@ def prune_library(
         build_index(
             settings,
             incremental=True,
-            build_image_index=(
-                settings.image_search.enabled
-                and settings.image_search.rebuild_on_ingest
-            ),
         )
     else:
         for name in _INDEX_FILES:

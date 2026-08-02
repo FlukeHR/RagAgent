@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from pathlib import Path
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -12,11 +14,150 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import BASE_DIR, Settings, load_settings
 from retrieval.chunker import Chunk, PaperChunker
-from retrieval.embedder import Embedder
-from retrieval.loader import PaperLoader
-from retrieval.image_index import PageImageIndex
-from retrieval.pdf_parse import provider_from_config
-from retrieval.vector_store import VectorStore
+from retrieval.documents import PaperDocument, PaperRepository, PaperSection
+from retrieval.index import Embedder, VectorStore
+from retrieval.mineru import (
+    MinerUAdapter,
+    MinerUError,
+    PDFParseProvider,
+    provider_from_config,
+)
+
+
+_SECTION_KEYWORDS = {
+    "abstract",
+    "introduction",
+    "related work",
+    "background",
+    "preliminaries",
+    "method",
+    "methodology",
+    "approach",
+    "model",
+    "architecture",
+    "experiment",
+    "experiments",
+    "experimental setup",
+    "results",
+    "evaluation",
+    "analysis",
+    "ablation",
+    "discussion",
+    "limitations",
+    "conclusion",
+    "conclusions",
+    "future work",
+    "references",
+    "acknowledgment",
+    "acknowledgments",
+    "acknowledgements",
+    "appendix",
+}
+_NUMBERED_HEADING = re.compile(r"^\d+(\.\d+)*\.?\s+[A-Z].{0,70}$")
+
+
+class DocumentNormalizer:
+    """Normalize plain UTF-8 text and Markdown during index construction."""
+
+    @staticmethod
+    def title(text: str, fallback: str) -> str:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= 8 and not stripped.lower().startswith("arxiv"):
+                return stripped[:200]
+        return fallback
+
+    def sections_from_text(self, text: str) -> list[PaperSection]:
+        sections: list[PaperSection] = []
+        current_title = "Body"
+        current_lines: list[str] = []
+
+        def flush() -> None:
+            body = "\n".join(current_lines).strip()
+            if body:
+                sections.append(PaperSection(title=current_title, text=body))
+
+        for line in text.splitlines():
+            if self.is_heading(line):
+                flush()
+                current_title = line.strip()[:80]
+                current_lines = []
+            else:
+                current_lines.append(line)
+        flush()
+        return sections or [PaperSection(title="Body", text=text.strip())]
+
+    @staticmethod
+    def is_heading(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped or len(stripped) > 80:
+            return False
+        return bool(_NUMBERED_HEADING.match(stripped)) or (
+            stripped.lower().rstrip(":.") in _SECTION_KEYWORDS
+        )
+
+
+class PaperLoader:
+    """Load PDFs through MinerU and plain text directly for index construction."""
+
+    def __init__(
+        self,
+        root_dir: str,
+        include_suffixes: tuple[str, ...] = (".pdf", ".txt", ".md"),
+        pdf_provider: PDFParseProvider | None = None,
+    ) -> None:
+        self.include_suffixes = include_suffixes
+        self.pdf_provider = pdf_provider
+        self.repository = PaperRepository(root_dir)
+        self.normalizer = DocumentNormalizer()
+        self.last_failures: dict[str, str] = {}
+
+    def iter_files(self) -> Iterable[Path]:
+        yield from self.repository.iter_files(self.include_suffixes)
+
+    def load_file(self, file: Path) -> PaperDocument | None:
+        if file.suffix.lower() == ".pdf":
+            try:
+                parsed = (self.pdf_provider or provider_from_config()).parse(file)
+            except MinerUError as exc:
+                self.last_failures[str(file)] = str(exc)
+                return None
+            text = "\n".join(
+                part
+                for part in (
+                    "\n".join(page.indexed_text for page in parsed.pages),
+                    "\n".join(element.content for element in parsed.elements),
+                )
+                if part.strip()
+            )
+            sections = parsed.sections
+            pages = parsed.pages
+            elements = parsed.elements
+            parser_metadata = parsed.parser_metadata
+        else:
+            text = self._read_text(file)
+            sections = self.normalizer.sections_from_text(text)
+            pages = []
+            elements = []
+            parser_metadata = {}
+        if not text.strip():
+            return None
+        return PaperDocument(
+            paper_id=file.stem,
+            title=self.normalizer.title(text, fallback=file.stem),
+            source=str(file),
+            sections=sections,
+            pages=pages,
+            elements=elements,
+            parser_metadata=parser_metadata,
+        )
+
+    @staticmethod
+    def _read_text(file: Path) -> str:
+        try:
+            return file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return file.read_text(encoding="utf-8", errors="ignore")
 
 
 def _file_hash(path: Path) -> str:
@@ -39,14 +180,7 @@ def _index_input_files(path: Path) -> list[Path]:
         files.extend(
             p
             for p in (
-                path.with_suffix(".ocr.json"),
-                path.with_suffix(".vlm.json"),
-                path.with_suffix(".elements.json"),
-                path.with_suffix(".layout.json"),
-                path.with_suffix(".tables.json"),
-                path.with_suffix(".figures.json"),
-                path.with_suffix(".formulas.json"),
-                path.with_suffix(".bboxes.json"),
+                path.with_suffix(".mineru.json"),
             )
             if p.exists()
         )
@@ -58,10 +192,10 @@ def _params_signature(settings: Settings, embedding_signature: dict) -> dict:
     return {
         "chunk_size": settings.index.chunk_size,
         "chunk_overlap": settings.index.chunk_overlap,
-        "chunk_metadata_version": 6,
+        "chunk_metadata_version": 7,
         "embedding": embedding_signature,
-        "pdf_parse_provider": settings.pdf_parse.provider,
-        "pdf_parse_auto_ocr": settings.pdf_parse.auto_ocr,
+        "pdf_parse_provider": "mineru",
+        "mineru_parser_fingerprint": MinerUAdapter(settings.mineru).fingerprint,
     }
 
 
@@ -110,7 +244,7 @@ def build_index(
     verbose: bool = False,
     *,
     embedder: Embedder | None = None,
-    build_image_index: bool | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> int:
     """为统一论文库构建索引（默认增量），返回 chunk 数量。
 
@@ -119,11 +253,7 @@ def build_index(
     data_dir = BASE_DIR / settings.project.data_root
     index_dir = BASE_DIR / settings.index.index_root
 
-    pdf_provider = provider_from_config(
-        settings.pdf_parse.provider,
-        auto_ocr=settings.pdf_parse.auto_ocr,
-        timeout_seconds=settings.pdf_parse.timeout_seconds,
-    )
+    pdf_provider = provider_from_config(settings.mineru)
     loader = PaperLoader(str(data_dir), pdf_provider=pdf_provider)
     files = list(loader.iter_files())
     cur_files = {str(f): _file_hash(f) for f in files}
@@ -161,16 +291,26 @@ def build_index(
     chunker = PaperChunker(settings.index.chunk_size, settings.index.chunk_overlap)
     by_path = {str(f): f for f in files}
     new_chunks: list[Chunk] = []
+    if progress:
+        progress("parsing")
     for src in build_sources:
         doc = loader.load_file(by_path[src])
         if doc is not None:
             new_chunks.extend(chunker.build([doc]))
+    if loader.last_failures:
+        details = "; ".join(
+            f"{Path(source).name}: {error}"
+            for source, error in sorted(loader.last_failures.items())
+        )
+        raise RuntimeError(f"MinerU parsing failed; index was not published: {details}")
 
     all_chunks = kept_chunks + new_chunks
     if not all_chunks:
         raise ValueError(f"未找到可索引的论文：{data_dir}")
 
     if new_chunks:
+        if progress:
+            progress("indexing")
         new_vectors = active_embedder.encode([c.content for c in new_chunks])
     else:
         new_vectors = None
@@ -178,7 +318,7 @@ def build_index(
     parts = [v for v in (kept_vectors, new_vectors) if v is not None and len(v)]
     all_vectors = np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32)
 
-    # OCR runtime may have generated a sidecar while parsing; persist its final hash.
+    # MinerU may have atomically generated a canonical sidecar while parsing.
     cur_files = {str(f): _file_hash(f) for f in files}
     store.build(
         all_chunks,
@@ -187,18 +327,6 @@ def build_index(
         params=params,
         embedding_signature=active_embedder.signature,
     )
-    should_build_images = (
-        settings.image_search.enabled
-        if build_image_index is None
-        else build_image_index
-    )
-    if should_build_images:
-        PageImageIndex(index_dir).build(
-            [path for path in files if path.suffix.lower() == ".pdf"],
-            max_pages=settings.image_search.max_pages,
-            max_side=settings.image_search.max_side,
-        )
-
     if verbose:
         n_changed = len([s for s in build_sources if s in prev_manifest.get("files", {})])
         n_new = len(build_sources) - n_changed

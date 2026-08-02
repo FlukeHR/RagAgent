@@ -4,16 +4,17 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from config.settings import BASE_DIR, Settings
 from indexing.build_index import build_index
 from indexing.prune import prune_library, touch_papers
-from retrieval.embedder import Embedder
-from retrieval.repository import (
+from retrieval.documents import (
     PaperRepository,
     arxiv_storage_id,
     normalize_arxiv_id,
 )
+from retrieval.index import Embedder
 
 
 _LIBRARY_LOCK = threading.Lock()
@@ -38,7 +39,11 @@ class PaperLibraryService:
         self.repository = PaperRepository(self.data_dir)
         self.last_embedder: Embedder | None = None
 
-    def ingest_arxiv(self, arxiv_ids: list[str]) -> IngestReport:
+    def ingest_arxiv(
+        self,
+        arxiv_ids: list[str],
+        progress: Callable[[str], None] | None = None,
+    ) -> IngestReport:
         normalized: list[str] = []
         for value in arxiv_ids[: self.settings.arxiv.max_ingest_papers]:
             aid = normalize_arxiv_id(value)
@@ -59,7 +64,7 @@ class PaperLibraryService:
                 else:
                     report.failed.append(aid)
 
-            if report.downloaded or not (self.index_dir / "manifest.json").exists():
+            if normalized:
                 if any(self.repository.iter_files((".pdf",))):
                     self.last_embedder = Embedder(
                         self.settings.embedding.model_name,
@@ -70,13 +75,10 @@ class PaperLibraryService:
                         self.settings,
                         incremental=True,
                         embedder=self.last_embedder,
-                        build_image_index=(
-                            self.settings.image_search.enabled
-                            and self.settings.image_search.rebuild_on_ingest
-                        ),
+                        progress=progress,
                     )
             else:
-                from retrieval.vector_store import VectorStore
+                from retrieval.index import VectorStore
 
                 store = VectorStore(str(self.index_dir))
                 store.load()
@@ -87,7 +89,7 @@ class PaperLibraryService:
                 touch_papers(self.settings, touched)
             prune_library(self.settings, protect=touched)
             if (self.index_dir / "manifest.json").exists():
-                from retrieval.vector_store import VectorStore
+                from retrieval.index import VectorStore
 
                 current = VectorStore(str(self.index_dir))
                 current.load()
