@@ -1,30 +1,57 @@
-# Python cache
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python caches, environments, and test output
 __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
-
-# Virtual envs
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
 .venv/
 venv/
 
-# macOS
-.DS_Store
+# Editor and local agent state
+.idea/
+.vscode/
+*.code-workspace
+/.agents/
+/.codex/
 
-# Runtime index artifacts
-/data/indexes/**
-/data/mineru-cache/**
-/data/*.sqlite3*
-/data/users/**
-/data/secrets/**
+# Application runtime data. Keep only the Python package marker in Git.
+/data/*
+!/data/__init__.py
 
-# Local logs
-*.log
+# Reproducible local model downloads
+/models/
 
-# Frontend build/cache
+# Frontend dependencies, caches, test output, and production build
 /frontend/web/node_modules/
-/frontend/web/dist/
 /frontend/web/.npm-cache/
+/frontend/web/.vite/
+/frontend/web/coverage/
+/frontend/web/dist/
 
-# 本地模型副本（体积大、可复现：缺失时代码自动回退 HF 在线下载）
-/models/**
+# Logs and interrupted temporary files
+*.log
+*.tmp
+*.temp
+*.part
+*.bak
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini

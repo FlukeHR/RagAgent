@@ -21,7 +21,7 @@
 - LangChain `create_agent`、LangGraph runtime、OpenAI-compatible Chat Completions。
 - MinerU 3.4.x、sentence-transformers、CrossEncoder。
 - FAISS 本地索引；不可用时降级为 NumPy。
-- SQLite 保存会话、arXiv proposal 和入库任务。
+- SQLite 保存账号、认证会话、模型配置、对话、论文元数据、arXiv proposal 和入库任务。
 
 ```text
 api/          FastAPI 接口与 UI 托管
@@ -31,9 +31,9 @@ llm/          LangChain 模型配置与本地降级
 retrieval/    MinerU adapter、切块、嵌入、重排与检索
 indexing/     论文库增量索引与容量治理
 services/     arXiv、MinerU、论文库和异步入库服务
-frontend/web/ 多会话前端
+frontend/web/ Vite + 原生 HTML/JS 多用户前端
 config/       集中配置
-data/papers/  扁平化论文库
+data/         本地运行时数据；除 data/__init__.py 外不进入 Git
 tests/        离线回归测试
 ```
 
@@ -41,7 +41,7 @@ tests/        离线回归测试
 
 ## Agent 与工具边界
 
-正常 `/ask` 只允许模型看到：
+正常 `/api/sessions/{conversation_id}/ask` 只允许模型看到：
 
 - `search_local_papers`
 - `inspect_paper`
@@ -52,11 +52,11 @@ tests/        离线回归测试
 arXiv 入库只能走显式接口：
 
 ```text
-POST /arxiv/ingest/proposals
+POST /api/arxiv/ingest/proposals
 → 用户选择 proposal 中的一个 arXiv ID
-→ POST /arxiv/ingest/confirm
+→ POST /api/arxiv/ingest/confirm
 → 单 worker 背景下载、MinerU 解析和索引
-→ GET /arxiv/ingest/jobs/{job_id}
+→ GET /api/ingest/jobs/{job_id}
 ```
 
 确认接口只接受 proposal 中的 ID，proposal 单次使用且有期限。背景任务直接调用论文库服务，不包装成模型工具。
@@ -82,20 +82,58 @@ LangChain middleware 至少限制模型调用数、工具总调用数和每工�
 
 所有模型、解析、检索、Agent 预算和任务上限集中在 `config/config.yaml`，不要在代码里复制常量。
 
-LLM 使用：
+服务级降级模型使用：
 
 - `llm.model_name`
 - `llm.openai_api_base`
 - `llm.openai_api_key`
 - 环境变量 `OPENAI_API_KEY`
 
-远程 endpoint 缺少 key 时必须走本地降级；localhost 可以 keyless。不要提交密钥，也不要默认启用 LangSmith 或其他外部遥测。
+Dashboard 的用户模型配置保存在 `data/app.sqlite3`，API key 使用 `data/secrets/master.key` 或 `PAPER_RAG_MASTER_KEY` 加密。远程 endpoint 缺少 key 时必须走本地降级；localhost 仅在精确白名单中允许 keyless。不要提交密钥，也不要默认启用 LangSmith 或其他外部遥测。
+
+## Git 提交边界
+
+可以提交：
+
+- `agent/`、`api/`、`config/`、`indexing/`、`llm/`、`retrieval/`、`services/`、`tools/` 下的源码。
+- `frontend/web/src/`、`index.html`、`package.json`、`package-lock.json` 和 Vite 配置。lockfile 必须随依赖变化提交。
+- `tests/`、`.github/workflows/`、`deploy/`、静态配置模板、迁移脚本和文档。
+- `.env.example`，但其中只能保留变量名、空值和无敏感性的示例。
+- `data/__init__.py`，仅用于保持 Python package；测试夹具应放在 `tests/fixtures/` 并确认许可与体积。
+
+禁止提交：
+
+- `data/` 下的 PDF、MinerU sidecar、索引、SQLite、用户目录、缓存、任务结果、注册表和主密钥。
+- 任何真实 `.env`、API key、cookie、session token、AES 主密钥、证书或私钥。
+- `models/`、`node_modules/`、`dist/`、npm/Vite cache、Python cache、虚拟环境、覆盖率、日志和临时 `.part` 文件。
+- `.vscode/`、`.idea/`、`.agents/`、`.codex/` 等本机编辑器或 Agent 状态。
+- 未经明确许可的论文原文、第三方数据集或其他可能受版权和隐私约束的研究资料。
+
+`.gitignore` 不能让已经跟踪的文件自动退出 Git。若发现运行时文件已被跟踪，先核对精确路径，再使用 `git rm --cached` 只移除索引记录；不得借此删除本地论文。若敏感数据或论文已经推送到远端，普通删除提交不会清除历史，重写历史必须由用户明确授权并先协调所有协作者。
+
+本仓库曾经跟踪过 `data/papers/` 和 `.vscode/settings.json`。处理这类遗留项时只能移除 Git 索引记录并保留本地文件，例如 `git rm -r --cached --ignore-unmatch -- data/papers .vscode`；执行前必须再次检查目标，执行后必须用 `git status` 确认没有误删其他文件。Agent 不得自行重写 Git 历史或强制推送。
+
+提交前至少执行：
+
+```bash
+git status --short --ignored
+git diff --cached --check
+git ls-files data
+python -m unittest discover -s tests
+ruff check .
+mypy .
+```
+
+`git ls-files data` 的正常结果只能包含 `data/__init__.py`。发现密钥、数据库、PDF、sidecar 或索引时立即停止提交，不得使用 `git add -f` 绕过规则。
 
 ## 常用命令
 
 ```bash
 pip install -r requirements.txt
-python indexing/build_index.py --full
+cd frontend/web
+npm install
+npm run build
+cd ../..
 uvicorn api.main:app --reload
 python indexing/prune.py --dry-run
 python -m unittest discover -s tests
@@ -119,9 +157,9 @@ mypy .
 
 ## 红线
 
-- 不提交密钥，不在自动流程中调用付费 API。
-- 不删除 `data/papers/` 下的论文，除非用户明确要求。
-- 不允许正常 `/ask` 写入 proposal、论文库或索引。
+- 不提交密钥、用户数据、论文、sidecar、索引或数据库，不在自动流程中调用付费 API。
+- 不删除 `data/papers/` 或 `data/users/` 下的论文，除非用户明确要求。
+- 不允许正常 `/api/sessions/{conversation_id}/ask` 写入 proposal、论文库或索引。
 - 不把下载、解析、shell、文件写入或任意网络请求暴露给模型。
 - 不恢复 PyMuPDF 内容解析、旧图片搜索工具或自研 Harness。
 - 不放行编造引用、越界 source 路径或未经确认的 arXiv ID。

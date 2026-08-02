@@ -82,6 +82,45 @@ tests/        不访问付费服务的离线回归测试
 
 项目不内置评测脚本、评测数据集或 LLM judge。`tests/` 只用于产品行为和安全边界回归。
 
+## Git 提交边界
+
+仓库只保存可复现的源码、配置模板和测试，不把本地论文库或运行状态当作源码提交。
+
+| 可以提交 | 不可以提交 |
+| --- | --- |
+| Python 源码、前端源码、测试、迁移脚本、Docker/CI 配置和文档 | `data/` 下的 PDF、MinerU sidecar、索引、SQLite、用户目录、缓存和任务结果 |
+| `config/config.yaml` 中不含密钥的默认配置 | `.env`、API key、session token、`master.key`、证书和私钥 |
+| `.env.example` 的空变量模板 | `models/`、虚拟环境、Python/npm/Vite cache、日志和覆盖率产物 |
+| `package.json` 与 `package-lock.json` | `node_modules/`、`frontend/web/dist/`、编辑器和本地 Agent 状态 |
+| `data/__init__.py` | 未经许可的论文原文、第三方数据集或用户研究资料 |
+
+当前 `.gitignore` 将整个 `data/` 视为运行时目录，只保留 `data/__init__.py`。前端 `dist/` 由 `npm run build` 生成，部署或本地启动前构建即可；`package-lock.json` 必须提交，以保证依赖版本可复现。
+
+提交前建议执行：
+
+```bash
+git status --short --ignored
+git diff --cached --check
+git ls-files data
+python -m unittest discover -s tests
+ruff check .
+mypy .
+```
+
+其中 `git ls-files data` 正常只能输出 `data/__init__.py`。不要使用 `git add -f` 强行加入论文、数据库、密钥或缓存。
+
+早期版本曾跟踪 `data/papers/` 下的 PDF、MinerU sidecar 和 `.registry.json`。新增 `.gitignore` 只能阻止它们以后再次加入，不能清除已有 Git 历史。若这些文件已推送到远端且不应继续保留，需要在备份和协作者协调完成后单独重写历史；普通删除提交只能从最新版本移除文件。
+
+从最新版本移除这些遗留跟踪项、但保留本地文件时，可在确认路径后执行一次：
+
+```bash
+git rm -r --cached --ignore-unmatch -- data/papers .vscode
+git add -- data/__init__.py .gitignore AGENTS.md Readme.md
+git status --short
+```
+
+这一步只处理当前 Git 索引，不会清除远端历史。不要在尚未备份或未确认协作者状态时执行历史重写或强制推送。
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -102,25 +141,17 @@ docker compose -f deploy/mineru-compose.yaml up -d
 
 默认连接 `http://127.0.0.1:8001`。服务只应监听 localhost，正式解析参数固定为 `hybrid-engine` 和 `high` effort。连接、轮询、解析 deadline、PDF 大小、页数、输出大小和并发上限均在 `config/config.yaml` 中配置。
 
-### 3. 准备论文并构建索引
+### 3. 准备论文
 
-把 PDF、TXT 或 Markdown 直接放进 `data/papers/`。PDF 必须成功生成同目录 `<paper_id>.mineru.json` 才会发布到新索引；解析失败不会降级为 PyMuPDF 文本抽取，也不会覆盖最后一次成功 sidecar。
+正常使用请在 Dashboard“论文库”中上传 PDF，或通过 arXiv proposal → confirm 流程入库。服务会把文件保存到 `data/users/<user_id>/papers/`，由单 worker 完成 MinerU 解析并原子发布该用户索引；这些内容全部属于被 Git 忽略的本地运行时数据。
 
-```bash
-python indexing/build_index.py
-```
+不要为了入库而把论文加入 Git，也不要再把 `data/papers/` 当作 Dashboard 的活动论文库。`data/papers/` 仅用于兼容旧版迁移；`indexing/build_index.py` 的无用户参数调用同样只服务于旧扁平论文库和维护场景。
 
-默认执行增量构建。解析器版本或选项变化后执行全量 MinerU rebuild：
-
-```bash
-python indexing/build_index.py --full
-```
-
-MinerU 原始任务输出保存在 `data/mineru-cache/`，canonical sidecar 不保存 base64。旧 `.ocr.json`、`.layout.json` 可以留在磁盘，但索引不会读取它们。
+PDF 必须成功生成同目录 `<paper_id>.mineru.json` 才会进入用户索引；解析失败不会降级为 PyMuPDF 文本抽取。MinerU 原始任务输出位于对应用户的 `mineru-cache/`，canonical sidecar 不保存 base64。
 
 ### 4. 配置模型
 
-模型通过 LangChain `ChatOpenAI` 访问 OpenAI-compatible Chat Completions：
+登录 Dashboard 后，在“设置”中创建模型配置。每个用户的 API key 都会加密保存且无法从接口读回。`config/config.yaml` 中的 `llm` 段仅作为服务级降级配置：
 
 ```yaml
 llm:
@@ -147,7 +178,7 @@ agent:
   max_total_tool_result_chars: 60000
 ```
 
-密钥优先通过环境变量提供：
+服务级降级密钥优先通过环境变量提供：
 
 ```powershell
 $env:OPENAI_API_KEY = "your-key"
