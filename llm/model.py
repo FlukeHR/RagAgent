@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -104,6 +105,35 @@ class LLMClient:
             }
         )
         return message_text(message)
+
+    def stream(self, prompt: str, system: str = DEFAULT_SYSTEM) -> Iterator[str]:
+        """Yield provider text chunks and record first-token/full latency."""
+
+        if not self.supports_agentic():
+            yield self._generate_local(prompt)
+            return
+        started = time.perf_counter()
+        first_token_ms: float | None = None
+        usage: dict[str, Any] = {}
+        for chunk in self.chat_model().stream(
+            [SystemMessage(content=system), HumanMessage(content=prompt)]
+        ):
+            usage = cast(dict[str, Any], getattr(chunk, "usage_metadata", None) or usage)
+            text = message_text(cast(AIMessage, chunk))
+            if not text:
+                continue
+            if first_token_ms is None:
+                first_token_ms = round((time.perf_counter() - started) * 1000, 1)
+            yield text
+        self._usage_events.append(
+            {
+                "operation": "stream",
+                "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                "first_token_ms": first_token_ms,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            }
+        )
 
     @staticmethod
     def _generate_local(prompt: str) -> str:

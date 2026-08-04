@@ -102,27 +102,30 @@ class AgentConfig:
     """Bounded LangChain runtime, conversation, and evidence settings."""
 
     token_budget: int
-    tool_result_max_chars: int = 10000
-    source_snippet_chars: int = 600
-    history_max_messages: int = 12
-    history_max_chars: int = 12000
-    history_summary_max_chars: int = 2000
+    tool_result_max_chars: int = 5000
+    source_snippet_chars: int = 350
+    history_max_messages: int = 6
+    history_max_chars: int = 5000
+    history_summary_max_chars: int = 1200
     memory_ttl_seconds: int = 604800
     memory_max_sessions: int = 500
     memory_db_path: str = "./data/sessions.sqlite3"
-    recent_history_messages: int = 8
-    max_model_calls: int = 5
-    max_graph_steps: int = 128
-    max_tool_calls: int = 6
-    max_local_search_calls: int = 2
-    max_inspect_calls: int = 2
-    max_arxiv_search_calls: int = 2
-    max_total_sources: int = 10
-    max_total_tool_result_chars: int = 24000
-    final_max_sources: int = 5
+    recent_history_messages: int = 4
+    max_model_calls: int = 2
+    max_graph_steps: int = 24
+    max_tool_calls: int = 2
+    max_local_search_calls: int = 1
+    max_inspect_calls: int = 1
+    max_arxiv_search_calls: int = 1
+    max_total_sources: int = 5
+    max_total_tool_result_chars: int = 8000
+    final_max_sources: int = 3
     final_max_sources_per_paper: int = 2
-    final_reuse_max_chars: int = 600
+    final_reuse_max_chars: int = 4000
     trace_value_max_chars: int = 500
+    fast_local_enabled: bool = True
+    fast_local_min_confidence: float = 0.35
+    prewarm_on_startup: bool = True
 
 
 @dataclass
@@ -266,6 +269,8 @@ def _validate_settings(settings: Settings) -> None:
         raise ValueError(
             "agent.final_max_sources_per_paper cannot exceed final_max_sources"
         )
+    if not 0.0 <= settings.agent.fast_local_min_confidence <= 1.0:
+        raise ValueError("agent.fast_local_min_confidence must be in [0, 1]")
     if not 0.0 <= settings.retrieval.claim_support_min_overlap <= 1.0:
         raise ValueError("retrieval.claim_support_min_overlap must be in [0, 1]")
     if not 0.0 <= settings.retrieval.answerability_min_confidence <= 1.0:

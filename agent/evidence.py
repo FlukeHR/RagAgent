@@ -451,13 +451,17 @@ class AnswerVerifier:
                 "hallucinated": result.checked.invalid,
             }
         )
-        valid_ids = set(result.checked.valid)
-        cited_sources = [
-            source
-            for source in result.sources
-            if str(source.get("id")) in valid_ids
-        ]
-        return AgentAnswer(answer, "answered", steps, cited_sources, trace)
+        if self.settings.retrieval.answerability_require_citation:
+            valid_ids = set(result.checked.valid)
+            answer_sources = [
+                source
+                for source in result.sources
+                if str(source.get("id")) in valid_ids
+            ]
+        else:
+            # Keep retrieved sources visible when inline citations are optional.
+            answer_sources = result.sources
+        return AgentAnswer(answer, "answered", steps, answer_sources, trace)
 
     @staticmethod
     def insufficient_answer(reason: str, sources: list[dict[str, Any]]) -> str:

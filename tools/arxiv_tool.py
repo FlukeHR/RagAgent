@@ -14,7 +14,9 @@ class ArxivTool:
         self.service = ArxivSearchService(settings)
 
     def run(self, query: str, max_results: int | None = None) -> ToolResult:
-        papers = self.service.search(query, max_results=max_results)
+        configured = self.settings.arxiv.max_results
+        limit = min(max_results or configured, configured)
+        papers = self.service.search(query, max_results=limit)
         if not papers:
             return ToolResult(text="arXiv returned no matching papers.")
         blocks: list[str] = [

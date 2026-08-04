@@ -11,7 +11,7 @@ from agent.memory import ConversationState
 from agent.runtime import AgentExecutionError
 from config.settings import BASE_DIR, load_settings
 from llm.model import LLMClient
-from tools.base import EvidenceSource
+from tools.base import EvidenceSource, ToolResult
 
 
 class AgentFlowTests(unittest.TestCase):
@@ -172,8 +172,96 @@ class AgentFlowTests(unittest.TestCase):
         missing = self.verifier.finalize(
             ExecutionResult("BERT 使用掩码语言模型作为预训练任务。", [source])
         )
-        self.assertEqual(missing.status, "insufficient_evidence")
-        self.assertIn("没有可回查引用", missing.answer)
+        self.assertEqual(missing.status, "answered")
+        self.assertEqual([item["id"] for item in missing.sources], ["S1"])
+
+        hallucinated = self.verifier.finalize(
+            ExecutionResult("BERT 使用掩码语言模型 [S99]。", [source])
+        )
+        self.assertEqual(hallucinated.status, "answered")
+        self.assertNotIn("[S99]", hallucinated.answer)
+        self.assertEqual([item["id"] for item in hallucinated.sources], ["S1"])
+
+    def test_verifier_accepts_zero_confidence_source_in_lax_mode(self) -> None:
+        source = EvidenceSource(
+            paper_id="paper",
+            paper_title="Paper",
+            section="Methods",
+            source=str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+            snippet="Retrieved evidence remains available to the answer.",
+            confidence=0.0,
+            citation_id="S1",
+        ).to_dict()
+
+        answer = self.verifier.finalize(ExecutionResult("直接回答。", [source]))
+
+        self.assertEqual(answer.status, "answered")
+        self.assertEqual([item["id"] for item in answer.sources], ["S1"])
+
+    def test_lax_verifier_accepts_uncited_required_tool_source(self) -> None:
+        agent = object.__new__(PaperRAGAgent)
+        agent.settings = self.settings
+        source = EvidenceSource(
+            paper_id="paper",
+            paper_title="Paper",
+            section="Methods",
+            source=str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+            snippet="Retrieved evidence.",
+            origin_tools=["search_local_papers"],
+            citation_id="S1",
+        ).to_dict()
+
+        missing = agent._uncited_required_tools(
+            ExecutionResult("Answer without an inline citation.", [source]),
+            ("search_local_papers",),
+        )
+
+        self.assertEqual(missing, ())
+
+    def test_fast_local_path_streams_one_model_answer(self) -> None:
+        class StreamingLLM:
+            @staticmethod
+            def stream(prompt: str, system: str = "") -> Any:
+                self.assertIn("[S1]", prompt)
+                self.assertIn("untrusted", system)
+                yield "快速"
+                yield "回答 [S1]"
+
+        agent = object.__new__(PaperRAGAgent)
+        agent.settings = self.settings
+        agent.llm = cast(Any, StreamingLLM())
+        agent.verifier = self.verifier
+        agent.selector = EvidenceSelector(self.settings)
+        agent.composer = FinalComposer(
+            self.settings,
+            agent.llm,
+            self.verifier,
+            agent.selector,
+        )
+        prefetched = ToolResult(
+            "{{cite:0}} evidence",
+            sources=[
+                EvidenceSource(
+                    paper_id="paper",
+                    paper_title="Paper",
+                    section="Methods",
+                    source=str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+                    snippet="Fast local evidence.",
+                    confidence=0.9,
+                )
+            ],
+            metadata={"retrieval": {"total_ms": 1.0}},
+        )
+        chunks: list[str] = []
+
+        result = agent._execute_fast_local(
+            "question", [], prefetched, chunks.append
+        )
+
+        self.assertTrue(agent._use_fast_local(prefetched))
+        self.assertEqual(result.answer, "快速回答 [S1]")
+        self.assertEqual(chunks, ["快速", "回答 [S1]"])
+        self.assertEqual(result.trace[0]["type"], "fast_local")
 
     def test_local_generation_preserves_source_ids(self) -> None:
         prompt = (

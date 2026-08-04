@@ -30,6 +30,7 @@ class ApiContractTests(unittest.TestCase):
             "/api/dashboard",
             "/api/model-profiles",
             "/api/sessions/{conversation_id}/ask",
+            "/api/sessions/{conversation_id}/ask/stream",
             "/api/papers/upload",
         ):
             self.assertIn(path, paths)

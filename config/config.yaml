@@ -6,8 +6,8 @@ index:
   index_root: ./data/indexes
   chunk_size: 1400
   chunk_overlap: 140
-  top_k_recall: 12
-  top_n_rerank: 4
+  top_k_recall: 8
+  top_n_rerank: 3
   rrf_k: 60
   max_chunks_per_parent: 2
 
@@ -18,21 +18,21 @@ embedding:
 
 rerank:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
-  use_cross_encoder: true
+  use_cross_encoder: false
 
 retrieval:
-  low_confidence_threshold: 0.5
-  weak_confidence_threshold: 0.35
+  low_confidence_threshold: 0.0
+  weak_confidence_threshold: 0.0
   min_confident_sources: 1
   answerability_min_sources: 1
-  answerability_min_score: 0.0
-  answerability_min_confidence: 0.25
-  answerability_require_citation: true
-  max_corrections: 1
+  answerability_min_score: -1000000000.0
+  answerability_min_confidence: 0.0
+  answerability_require_citation: false
+  max_corrections: 0
   cjk_ngram_size: 2
   deduplicate_evidence: true
-  conflict_detection: true
-  claim_support_min_overlap: 0.12
+  conflict_detection: false
+  claim_support_min_overlap: 0.0
 
 mineru:
   api_base_url: http://127.0.0.1:8001
@@ -57,44 +57,47 @@ mineru:
 
 llm:
   model_name: deepseek-v4-flash
-  max_tokens: 2048
+  max_tokens: 768
   openai_api_base: https://api.deepseek.com
   openai_api_key: ""
-  request_timeout_seconds: 120
-  connect_timeout_seconds: 30
-  max_retries: 2
+  request_timeout_seconds: 60
+  connect_timeout_seconds: 5
+  max_retries: 0
 
 arxiv:
-  max_results: 5
+  max_results: 3
   max_ingest_papers: 1
   max_pdf_mb: 30
   max_papers: 200
   max_age_days: 0
-  request_timeout_seconds: 60
+  request_timeout_seconds: 15
 
 agent:
-  token_budget: 60000
-  tool_result_max_chars: 10000
-  source_snippet_chars: 600
-  history_max_messages: 12
-  history_max_chars: 12000
-  history_summary_max_chars: 2000
+  token_budget: 12000
+  tool_result_max_chars: 5000
+  source_snippet_chars: 350
+  history_max_messages: 6
+  history_max_chars: 5000
+  history_summary_max_chars: 1200
   memory_ttl_seconds: 604800
   memory_max_sessions: 500
   memory_db_path: ./data/sessions.sqlite3
-  recent_history_messages: 8
-  max_model_calls: 5
-  max_graph_steps: 128
-  max_tool_calls: 6
-  max_local_search_calls: 2
-  max_inspect_calls: 2
-  max_arxiv_search_calls: 2
-  max_total_sources: 10
-  max_total_tool_result_chars: 24000
-  final_max_sources: 5
+  recent_history_messages: 4
+  max_model_calls: 2
+  max_graph_steps: 24
+  max_tool_calls: 2
+  max_local_search_calls: 1
+  max_inspect_calls: 1
+  max_arxiv_search_calls: 1
+  max_total_sources: 5
+  max_total_tool_result_chars: 8000
+  final_max_sources: 3
   final_max_sources_per_paper: 2
-  final_reuse_max_chars: 600
+  final_reuse_max_chars: 4000
   trace_value_max_chars: 500
+  fast_local_enabled: true
+  fast_local_min_confidence: 0.35
+  prewarm_on_startup: true
 
 app:
   database_path: ./data/app.sqlite3

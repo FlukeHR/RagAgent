@@ -2,7 +2,7 @@
 
 面向学术论文的本地 Agentic RAG 系统。PDF 由独立的 MinerU GPU 服务统一解析，问答阶段只读取 canonical sidecar 和本地索引；LangChain `create_agent` 负责有界工具循环，项目层负责论文来源、引用与 answerability 核查。
 
-系统提供 Dense + BM25 多路召回、RRF 融合、CrossEncoder 重排、MinerU 表格／公式／图表元素检索、`[S编号]` 引用回查、低置信有界纠错、多轮会话和两阶段 arXiv 入库。没有可用模型后端时，会降级到本地检索路径。
+系统提供 Dense + BM25 多路召回、RRF 融合、可选 CrossEncoder 重排、MinerU 表格／公式／图表元素检索、`[S编号]` 引用回查、流式回答、多轮会话和两阶段 arXiv 入库。没有可用模型后端时，会降级到本地检索路径。
 
 ## 本地多用户 Dashboard
 
@@ -43,14 +43,14 @@ PDF
 → localhost MinerU 3.4.x（hybrid-engine + high effort）
 → <paper_id>.mineru.json
 → text / page / element chunks
-→ Dense + BM25 → RRF → CrossEncoder
+→ Dense + BM25 → RRF → 轻量词面重排（可选 CrossEncoder）
 
 用户问题 + 有界历史
-→ Plan：查询改写、直接回答／澄清／执行路径路由
-→ Execute：LangChain Agent 选择 search_local_papers / inspect_paper / search_arxiv
+→ 预取一次本地证据
+→ 高相关：单次模型流式生成
+→ 低相关：LangChain Agent 基于预取证据选择 inspect_paper / search_arxiv / 补充本地搜索
 → evidence envelope
-→ Verify：来源充分性、引用与冲突核查
-→ 不足时在预算内改写查询或选择新工具继续补证
+→ Verify：来源存在性与引用真实性核查
 → answer + sources + steps + trace
 ```
 
@@ -60,7 +60,7 @@ PDF
 - `inspect_paper`：按论文 overview、section、1-based page、MinerU element 或 0–1000 normalized region 精读。
 - `search_arxiv`：只搜索 arXiv 元数据与摘要，不建立 proposal、不下载 PDF、不修改论文库。
 
-请求先由结构化语义 Planner 判定为直接回答、请求澄清或工具执行，并同时给出独立查询与不可缺少的工具能力。代码不维护问候语、时效词或工具关键词表；Planner 约束通过可信 system contract 注入，执行模型仍自主决定工具参数和调用顺序，Verify 再核查最终答案是否引用了对应工具来源。必需工具失败时返回证据不足，不会用其他路径冒充结果。
+问答链路不再串行调用独立 Planner。系统先执行一次本地混合检索，以检索置信度而不是关键词路由：相关证据充分时直接进行一次模型生成；否则把同一批预取证据放入不可信 evidence envelope，由 LangChain Agent 决定是否调用三个只读工具。常见本地问题因此只需要一个模型往返，复杂问题最多使用两个 Agent 模型回合。`/api/sessions/{conversation_id}/ask/stream` 以 NDJSON 返回生成片段与最终核查结果；trace 同时记录检索分段耗时、模型往返、首 token、服务端总耗时和浏览器端端到端耗时。
 
 arXiv 下载、MinerU 解析和索引从不作为模型工具执行，只能由用户显式调用 proposal 与 confirm API。
 
@@ -156,26 +156,29 @@ PDF 必须成功生成同目录 `<paper_id>.mineru.json` 才会进入用户索�
 ```yaml
 llm:
   model_name: deepseek-v4-flash
-  max_tokens: 2048
+  max_tokens: 768
   openai_api_base: https://api.deepseek.com
   openai_api_key: ""
-  request_timeout_seconds: 120
-  connect_timeout_seconds: 30
-  max_retries: 2
+  request_timeout_seconds: 60
+  connect_timeout_seconds: 5
+  max_retries: 0
 
 agent:
-  max_model_calls: 5
-  max_graph_steps: 128
-  max_tool_calls: 6
-  max_local_search_calls: 2
-  max_inspect_calls: 2
-  max_arxiv_search_calls: 2
-  token_budget: 60000
-  max_total_sources: 10
-  final_max_sources: 5
+  max_model_calls: 2
+  max_graph_steps: 24
+  max_tool_calls: 2
+  max_local_search_calls: 1
+  max_inspect_calls: 1
+  max_arxiv_search_calls: 1
+  token_budget: 12000
+  max_total_sources: 5
+  final_max_sources: 3
   final_max_sources_per_paper: 2
-  final_reuse_max_chars: 600
-  max_total_tool_result_chars: 60000
+  final_reuse_max_chars: 4000
+  max_total_tool_result_chars: 8000
+  fast_local_enabled: true
+  fast_local_min_confidence: 0.35
+  prewarm_on_startup: true
 ```
 
 服务级降级密钥优先通过环境变量提供：
@@ -228,7 +231,7 @@ arXiv 入库必须经过两次明确动作：先创建 proposal，再从返回�
 
 ## 检索与会话
 
-索引保存 text、page 和 element chunk，metadata 保留 paper、section、source、page、element、modality、bbox、heading path 和 parser metadata。FAISS 可用时使用本地向量索引，否则降级为 NumPy；Dense 与 BM25 结果通过 RRF 融合后再由 CrossEncoder 重排。
+索引保存 text、page 和 element chunk，metadata 保留 paper、section、source、page、element、modality、bbox、heading path 和 parser metadata。FAISS 可用时使用本地向量索引，否则降级为 NumPy；Dense 与 BM25 结果通过 RRF 融合。默认低延迟配置使用轻量词面重排；需要更高排序质量时可重新开启 CrossEncoder。Embedding 与 reranker 实例在用户 Agent 间共享，本地模型和用户索引会在启动、模型配置读取或新会话建立后后台预热。
 
 完整会话以服务端 `data/app.sqlite3` 为准，浏览器只保存主题、侧栏状态和未发送草稿。送入模型的历史仍受消息数和字符预算限制；论文、索引、会话、任务和模型配置都使用不可变用户 UUID 隔离，跨用户资源访问统一返回 404。
 

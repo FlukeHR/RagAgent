@@ -37,6 +37,7 @@ class Embedder:
         )
         self._load_attempted = False
         self._load_lock = threading.Lock()
+        self._encode_lock = threading.Lock()
 
     def _ensure_model(self) -> None:
         if not self.use_sentence_transformers:
@@ -82,9 +83,10 @@ class Embedder:
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
         if self._st_model is not None:
-            values = self._st_model.encode(
-                list(texts), convert_to_numpy=True, normalize_embeddings=True
-            )
+            with self._encode_lock:
+                values = self._st_model.encode(
+                    list(texts), convert_to_numpy=True, normalize_embeddings=True
+                )
             return values.astype(np.float32)
         sparse = self._vectorizer.transform(list(texts))
         dense = sparse.toarray().astype(np.float32)

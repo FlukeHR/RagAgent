@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -94,6 +95,7 @@ class Reranker:
         self.load_error: str | None = None
         self._load_attempted = False
         self._load_lock = threading.Lock()
+        self._predict_lock = threading.Lock()
 
     def _ensure_model(self) -> None:
         if not self.use_cross_encoder:
@@ -125,7 +127,8 @@ class Reranker:
         self._ensure_model()
         if self._cross_encoder is not None:
             pairs = [[query, item[0].content] for item in candidates]
-            scores = self._cross_encoder.predict(pairs)
+            with self._predict_lock:
+                scores = self._cross_encoder.predict(pairs)
             ranked = sorted(
                 zip((item[0] for item in candidates), scores),
                 key=lambda item: item[1],
@@ -272,6 +275,10 @@ class RetrievalPipeline:
 class Retriever:
     """Filterable Dense + BM25 + RRF + diversification + reranking search."""
 
+    _shared_lock = threading.Lock()
+    _shared_embedders: dict[tuple[str, bool, int], Embedder] = {}
+    _shared_rerankers: dict[tuple[str, bool, int], Reranker] = {}
+
     def __init__(
         self,
         settings: Settings,
@@ -280,17 +287,9 @@ class Retriever:
     ) -> None:
         self.settings = settings
         self.analyzer = QueryAnalyzer(settings.retrieval.cjk_ngram_size)
-        self.embedder = embedder or Embedder(
-            settings.embedding.model_name,
-            settings.embedding.use_sentence_transformers,
-            settings.embedding.fallback_dimension,
-        )
+        self.embedder = embedder or self._shared_embedder(settings)
         self.store = VectorStore(index_dir=index_dir)
-        self.reranker = Reranker(
-            settings.rerank.model_name,
-            settings.rerank.use_cross_encoder,
-            analyzer=self.analyzer,
-        )
+        self.reranker = self._shared_reranker(settings)
         self.pipeline = RetrievalPipeline(
             self.reranker,
             settings.index.rrf_k,
@@ -300,6 +299,51 @@ class Retriever:
         self._bm25_generation: str | None = None
         self.last_trace: dict[str, float | str | int] = {}
         self._search_lock = threading.Lock()
+
+    @classmethod
+    def _shared_embedder(cls, settings: Settings) -> Embedder:
+        key = (
+            settings.embedding.model_name,
+            settings.embedding.use_sentence_transformers,
+            settings.embedding.fallback_dimension,
+        )
+        with cls._shared_lock:
+            embedder = cls._shared_embedders.get(key)
+            if embedder is None:
+                embedder = Embedder(*key)
+                cls._shared_embedders[key] = embedder
+            return embedder
+
+    @classmethod
+    def _shared_reranker(cls, settings: Settings) -> Reranker:
+        key = (
+            settings.rerank.model_name,
+            settings.rerank.use_cross_encoder,
+            settings.retrieval.cjk_ngram_size,
+        )
+        with cls._shared_lock:
+            reranker = cls._shared_rerankers.get(key)
+            if reranker is None:
+                reranker = Reranker(
+                    settings.rerank.model_name,
+                    settings.rerank.use_cross_encoder,
+                    analyzer=QueryAnalyzer(settings.retrieval.cjk_ngram_size),
+                )
+                cls._shared_rerankers[key] = reranker
+            return reranker
+
+    def prewarm(self) -> dict[str, str | int]:
+        """Load immutable query models and this user's local index ahead of a request."""
+
+        with self._search_lock:
+            self._ensure_store()
+            self.embedder.encode(["paper retrieval warmup"])
+            self._bm25_index()
+            return {
+                "embedding": self.embedder.backend,
+                "reranker": self.reranker.backend,
+                "chunks": len(self.store.chunks),
+            }
 
     def _ensure_store(self) -> None:
         if self.store.generation is None:
@@ -430,3 +474,23 @@ class Retriever:
             "results": len(results),
         }
         return results
+
+
+def prewarm_shared_models(settings: Settings) -> dict[str, str]:
+    """Warm locally installed immutable models without triggering downloads."""
+
+    embedding_path = resolve_model_path(settings.embedding.model_name)
+    if settings.embedding.use_sentence_transformers and not Path(embedding_path).is_dir():
+        return {"status": "skipped", "reason": "embedding_model_not_local"}
+    embedder = Retriever._shared_embedder(settings)
+    embedder.encode(["paper retrieval warmup"])
+    reranker = Retriever._shared_reranker(settings)
+    if settings.rerank.use_cross_encoder:
+        reranker_path = resolve_model_path(settings.rerank.model_name)
+        if Path(reranker_path).is_dir():
+            _ = reranker.backend
+    return {
+        "status": "ready",
+        "embedding": embedder.backend,
+        "reranker": reranker.backend,
+    }

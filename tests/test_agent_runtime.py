@@ -107,7 +107,10 @@ class AgentRuntimeTests(unittest.TestCase):
             papers = ArxivSearchService(self.settings).search("agentic rag")
         url = str(get.call_args.args[0])
         self.assertIn("sortBy=relevance", url)
-        self.assertIn("max_results=20", url)
+        self.assertIn(
+            f"max_results={self.settings.arxiv.max_results * 4}",
+            url,
+        )
         self.assertEqual([paper.title for paper in papers], ["Newer", "Older"])
 
     def test_planner_contract_does_not_force_provider_tool_choice(self) -> None:
@@ -176,6 +179,129 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.partial.trace[-1]["type"], "agent_runtime_error"
         )
+
+    def test_runtime_registers_prefetched_local_evidence_before_model(self) -> None:
+        local_llm = replace(
+            self.settings.llm,
+            openai_api_base="http://127.0.0.1:9",
+            openai_api_key="",
+        )
+        settings = replace(self.settings, llm=local_llm)
+        stub = _StubTool()
+        runtime = LangChainAgentRuntime(
+            settings,
+            LLMClient(local_llm),
+            cast(Any, stub),
+            cast(Any, stub),
+            cast(Any, stub),
+        )
+        source = EvidenceSource(
+            "paper",
+            "Paper",
+            "Methods",
+            str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+            snippet="prefetched evidence",
+        )
+
+        class SuccessfulGraph:
+            @staticmethod
+            def invoke(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                self.assertIn("[S1]", payload["messages"][-1]["content"])
+                self.assertEqual(len(kwargs["context"].evidence.sources), 1)
+                return {"messages": [AIMessage(content="answer [S1]")]}
+
+        runtime.graph = cast(Any, SuccessfulGraph())
+        result = runtime.invoke(
+            "question",
+            [],
+            prefetched_local=ToolResult(
+                "{{cite:0}} prefetched evidence", sources=[source]
+            ),
+        )
+
+        self.assertEqual(result.answer, "answer [S1]")
+        self.assertEqual(result.sources[0]["id"], "S1")
+
+    def test_runtime_streams_final_model_text(self) -> None:
+        local_llm = replace(
+            self.settings.llm,
+            openai_api_base="http://127.0.0.1:9",
+            openai_api_key="",
+        )
+        settings = replace(self.settings, llm=local_llm)
+        stub = _StubTool()
+        runtime = LangChainAgentRuntime(
+            settings,
+            LLMClient(local_llm),
+            cast(Any, stub),
+            cast(Any, stub),
+            cast(Any, stub),
+        )
+
+        class StreamingGraph:
+            @staticmethod
+            def stream(*args: object, **kwargs: Any) -> Any:
+                del args, kwargs
+                yield "messages", (AIMessage(content="streamed "), {})
+                yield "messages", (
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "search_arxiv",
+                                "args": {"query": "q"},
+                                "id": "call-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    {},
+                )
+                yield "messages", (AIMessage(content="answer"), {})
+                yield "values", {"messages": [AIMessage(content="streamed answer")]}
+
+        runtime.graph = cast(Any, StreamingGraph())
+        chunks: list[str] = []
+        result = runtime.invoke("question", [], token_sink=chunks.append)
+
+        self.assertEqual(chunks, ["streamed ", "answer"])
+        self.assertEqual(result.answer, "streamed answer")
+
+    def test_runtime_hides_direct_answer_marker_from_stream(self) -> None:
+        local_llm = replace(
+            self.settings.llm,
+            openai_api_base="http://127.0.0.1:9",
+            openai_api_key="",
+        )
+        settings = replace(self.settings, llm=local_llm)
+        stub = _StubTool()
+        runtime = LangChainAgentRuntime(
+            settings,
+            LLMClient(local_llm),
+            cast(Any, stub),
+            cast(Any, stub),
+            cast(Any, stub),
+        )
+
+        class DirectGraph:
+            @staticmethod
+            def stream(*args: object, **kwargs: Any) -> Any:
+                del args, kwargs
+                yield "messages", (AIMessage(content="[[DIRECT_"), {})
+                yield "messages", (AIMessage(content="NO_EVIDENCE]]你好"), {})
+                yield "values", {
+                    "messages": [
+                        AIMessage(content="[[DIRECT_NO_EVIDENCE]]你好")
+                    ]
+                }
+
+        runtime.graph = cast(Any, DirectGraph())
+        chunks: list[str] = []
+        result = runtime.invoke("hello", [], token_sink=chunks.append)
+
+        self.assertEqual(chunks, ["你好"])
+        self.assertEqual(result.answer, "你好")
+        self.assertEqual(result.trace[-1]["type"], "direct")
 
     def test_pydantic_schemas_reject_extra_fields_and_invalid_locators(self) -> None:
         injected = ToolRuntime(
@@ -307,6 +433,14 @@ class AgentRuntimeTests(unittest.TestCase):
     def test_token_budget_and_citation_correction_are_bounded(self) -> None:
         verifier = AnswerVerificationMiddleware()
         context = self.context()
+        context.settings = replace(
+            context.settings,
+            retrieval=replace(
+                context.settings.retrieval,
+                answerability_require_citation=True,
+                max_corrections=1,
+            ),
+        )
         runtime = SimpleNamespace(context=context)
         first = verifier.after_model(
             {"messages": [AIMessage(content="unsupported")]}, runtime

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import queue
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -10,7 +13,7 @@ from urllib.parse import urlparse, urlunparse
 
 import fitz
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from api.dependencies import (
     AuthContext,
@@ -81,10 +84,10 @@ def dashboard(context: AuthContext = Depends(current_auth)) -> dict[str, Any]:
 def list_model_profiles(
     context: AuthContext = Depends(current_auth),
 ) -> list[ModelProfileResponse]:
-    return [
-        _profile_response(profile)
-        for profile in store().list_model_profiles(context.user.user_id)
-    ]
+    profiles = store().list_model_profiles(context.user.user_id)
+    for profile in profiles:
+        agent_pool().schedule_prewarm(context.user.user_id, profile)
+    return [_profile_response(profile) for profile in profiles]
 
 
 @router.post("/model-profiles", response_model=ModelProfileResponse, status_code=201)
@@ -122,6 +125,7 @@ def create_model_profile(
         if "UNIQUE constraint failed" in str(exc):
             raise HTTPException(status_code=409, detail="模型配置名称已存在") from exc
         raise
+    agent_pool().schedule_prewarm(context.user.user_id, profile)
     return _profile_response(profile)
 
 
@@ -163,6 +167,7 @@ def update_model_profile(
         raise
     assert profile is not None
     agent_pool().invalidate(context.user.user_id, profile_id)
+    agent_pool().schedule_prewarm(context.user.user_id, profile)
     return _profile_response(profile)
 
 
@@ -232,6 +237,10 @@ def create_session(
         profile_id = str(profiles[0]["profile_id"]) if profiles else None
     elif store().get_model_profile(context.user.user_id, profile_id) is None:
         raise HTTPException(status_code=404, detail="模型配置不存在")
+    if profile_id is not None:
+        profile = store().get_model_profile(context.user.user_id, profile_id)
+        if profile is not None:
+            agent_pool().schedule_prewarm(context.user.user_id, profile)
     return store().create_conversation(
         context.user.user_id, _safe_title(payload.title, "新对话"), profile_id
     )
@@ -343,6 +352,100 @@ def ask_session(
         sources=[SourceItem.model_validate(source) for source in sources],
         trace=result.trace,
         suggested_actions=actions,
+    )
+
+
+@router.post("/sessions/{conversation_id}/ask/stream")
+def ask_session_stream(
+    conversation_id: str,
+    payload: SessionAskRequest,
+    context: AuthContext = Depends(require_csrf),
+) -> StreamingResponse:
+    """Stream fast-path model tokens, then emit the verified persisted response."""
+
+    conversation = store().get_conversation(context.user.user_id, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    profile_id = conversation.get("model_profile_id")
+    if not profile_id:
+        raise HTTPException(status_code=409, detail="Select a model profile first")
+    profile = store().get_model_profile(context.user.user_id, str(profile_id))
+    if profile is None:
+        raise HTTPException(status_code=409, detail="Model profile no longer exists")
+    previous = list(conversation.get("messages") or [])
+    history = [
+        {"role": item["role"], "content": item["content"]}
+        for item in previous
+        if item.get("role") in {"user", "assistant"}
+    ]
+    store().add_message(
+        context.user.user_id, conversation_id, "user", payload.question
+    )
+    if not previous and str(conversation["title"]) == "新对话":
+        store().update_conversation(
+            context.user.user_id,
+            conversation_id,
+            title=_safe_title(payload.question[:24], "新对话"),
+        )
+
+    events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def run() -> None:
+        try:
+            result = agent_pool().get(context.user.user_id, profile).ask(
+                payload.question,
+                history=history,
+                session_id=None,
+                token_sink=lambda token: events.put({"type": "token", "text": token}),
+            )
+            sources = _present_sources(context.user.user_id, result.sources)
+            actions = _suggested_actions(payload.question, sources)
+            store().add_message(
+                context.user.user_id,
+                conversation_id,
+                "assistant",
+                result.answer,
+                status=result.status,
+                sources=sources,
+                steps=result.steps,
+                trace=result.trace,
+                actions=actions,
+            )
+            response = AskResponse(
+                answer=result.answer,
+                status=result.status,
+                steps=result.steps,
+                sources=[SourceItem.model_validate(source) for source in sources],
+                trace=result.trace,
+                suggested_actions=actions,
+            )
+            events.put({"type": "final", "result": response.model_dump(mode="json")})
+        except FileNotFoundError:
+            events.put({"type": "error", "message": "No searchable paper index exists"})
+        except Exception as exc:  # noqa: BLE001 - do not expose provider details
+            events.put(
+                {
+                    "type": "error",
+                    "message": f"Question execution failed ({type(exc).__name__})",
+                }
+            )
+        finally:
+            events.put(None)
+
+    def generate() -> Any:
+        yield json.dumps({"type": "start"}, ensure_ascii=False) + "\n"
+        worker = threading.Thread(target=run, name="rag-answer-stream", daemon=True)
+        worker.start()
+        while True:
+            event = events.get()
+            if event is None:
+                break
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

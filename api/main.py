@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -8,7 +9,8 @@ from fastapi.staticfiles import StaticFiles
 
 from api.app_routes import router as app_router
 from api.auth_routes import router as auth_router
-from api.dependencies import ingest_manager
+from api.dependencies import ingest_manager, settings
+from retrieval.search import prewarm_shared_models
 
 app = FastAPI(title="Paper RAG Agent", version="0.2.0")
 app.include_router(auth_router)
@@ -20,6 +22,13 @@ def initialize_background_services() -> None:
     """Initialize the unified store and mark interrupted local jobs retryable."""
 
     ingest_manager()
+    if settings().agent.prewarm_on_startup:
+        threading.Thread(
+            target=prewarm_shared_models,
+            args=(settings(),),
+            name="rag-model-prewarm",
+            daemon=True,
+        ).start()
 
 
 @app.middleware("http")

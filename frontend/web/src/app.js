@@ -1,5 +1,5 @@
 import "./styles.css";
-import { api, jsonBody, setCsrfToken } from "./api.js";
+import { api, jsonBody, setCsrfToken, streamApi } from "./api.js";
 import {
   escapeHtml,
   formatDate,
@@ -370,14 +370,14 @@ function renderMessages() {
     }
     target.append(article);
   });
-  if (state.sending) {
+  if (state.sending && messages.at(-1)?.role !== "assistant") {
     const thinking = document.createElement("article");
     thinking.className = "message assistant";
-    thinking.innerHTML = `<div class="message-role">PaperDesk</div><div class="thinking">正在规划检索并核对引用</div>`;
+    thinking.innerHTML = `<div class="message-role">PaperDesk</div><div class="thinking">正在检索并生成回答</div>`;
     target.append(thinking);
   }
   target.scrollTop = target.scrollHeight;
-  window.MathJax?.typesetPromise?.([target]).catch(() => {});
+  if (!state.sending) window.MathJax?.typesetPromise?.([target]).catch(() => {});
 }
 
 async function newSession() {
@@ -402,18 +402,64 @@ async function sendQuestion(event) {
   input.value = "";
   localStorage.removeItem("paperdesk_draft");
   renderMessages();
-  try {
-    await api(`/sessions/${state.activeSession.conversation_id}/ask`, {
-      method: "POST", body: jsonBody({ question }),
+  let streamedMessage = null;
+  let finalResult = null;
+  const requestStarted = performance.now();
+  let firstTokenMs = null;
+  let renderPending = false;
+  const scheduleRender = () => {
+    if (renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(() => {
+      renderPending = false;
+      renderMessages();
     });
-    state.activeSession = await api(`/sessions/${state.activeSession.conversation_id}`);
-    await loadCommon();
+  };
+  try {
+    await streamApi(`/sessions/${state.activeSession.conversation_id}/ask/stream`, {
+      method: "POST", body: jsonBody({ question }),
+    }, (streamEvent) => {
+      if (streamEvent.type === "token") {
+        if (firstTokenMs === null) firstTokenMs = performance.now() - requestStarted;
+        if (!streamedMessage) {
+          streamedMessage = { role: "assistant", content: "", sources: [], steps: [] };
+          state.activeSession.messages.push(streamedMessage);
+        }
+        streamedMessage.content += streamEvent.text || "";
+        scheduleRender();
+      } else if (streamEvent.type === "final") {
+        finalResult = streamEvent.result;
+        const totalMs = performance.now() - requestStarted;
+        if (!streamedMessage) {
+          streamedMessage = { role: "assistant", content: "", sources: [], steps: [] };
+          state.activeSession.messages.push(streamedMessage);
+        }
+        Object.assign(streamedMessage, {
+          content: finalResult.answer,
+          status: finalResult.status,
+          sources: finalResult.sources || [],
+          steps: finalResult.steps || [],
+          trace: [
+            ...(finalResult.trace || []),
+            {
+              type: "client_latency",
+              first_token_ms: Math.round(firstTokenMs ?? totalMs),
+              duration_ms: Math.round(totalMs),
+            },
+          ],
+          actions: finalResult.suggested_actions || [],
+        });
+        renderMessages();
+      }
+    });
+    if (!finalResult) throw new Error("回答串流未返回最终结果");
   } catch (error) {
     toast(error.message, true);
     state.activeSession = await api(`/sessions/${state.activeSession.conversation_id}`);
   } finally {
     state.sending = false;
     renderShell();
+    loadCommon().then(() => renderShell()).catch(() => {});
   }
 }
 

@@ -103,6 +103,8 @@ class AgentPool:
         self.max_size = max_size
         self._agents: OrderedDict[tuple[str, str, float], PaperRAGAgent] = OrderedDict()
         self._lock = threading.RLock()
+        self._prewarming: set[tuple[str, str, float]] = set()
+        self._prewarmed: set[tuple[str, str, float]] = set()
 
     def get(self, user_id: str, profile: dict[str, Any]) -> PaperRAGAgent:
         """Return a scoped Agent, decrypting its credential only in process memory."""
@@ -133,6 +135,36 @@ class AgentPool:
                 self._agents.popitem(last=False)
             return agent
 
+    def schedule_prewarm(self, user_id: str, profile: dict[str, Any]) -> None:
+        """Warm one scoped Agent in the background before its first question."""
+
+        if not self.settings.agent.prewarm_on_startup:
+            return
+        key = (user_id, str(profile["profile_id"]), float(profile["updated_at"]))
+        with self._lock:
+            if key in self._prewarming or key in self._prewarmed:
+                return
+            self._prewarming.add(key)
+
+        def run() -> None:
+            succeeded = False
+            try:
+                self.get(user_id, profile).prewarm()
+                succeeded = True
+            except Exception:  # noqa: BLE001 - prewarm is opportunistic
+                pass
+            finally:
+                with self._lock:
+                    self._prewarming.discard(key)
+                    if succeeded:
+                        self._prewarmed.add(key)
+
+        threading.Thread(
+            target=run,
+            name=f"rag-prewarm-{key[1][:8]}",
+            daemon=True,
+        ).start()
+
     def invalidate(self, user_id: str, profile_id: str | None = None) -> None:
         """Evict cached agents after a key, model, or index-affecting change."""
 
@@ -140,3 +172,11 @@ class AgentPool:
             for key in list(self._agents):
                 if key[0] == user_id and (profile_id is None or key[1] == profile_id):
                     self._agents.pop(key, None)
+            self._prewarmed = {
+                key
+                for key in self._prewarmed
+                if not (
+                    key[0] == user_id
+                    and (profile_id is None or key[1] == profile_id)
+                )
+            }
