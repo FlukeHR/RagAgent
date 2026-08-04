@@ -427,6 +427,10 @@ async function sendQuestion(event) {
         }
         streamedMessage.content += streamEvent.text || "";
         scheduleRender();
+      } else if (streamEvent.type === "reset") {
+        firstTokenMs = null;
+        if (streamedMessage) streamedMessage.content = "";
+        scheduleRender();
       } else if (streamEvent.type === "final") {
         finalResult = streamEvent.result;
         const totalMs = performance.now() - requestStarted;

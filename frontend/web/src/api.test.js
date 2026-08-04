@@ -13,7 +13,8 @@ describe("streamApi", () => {
     const body = new ReadableStream({
       start(controller) {
         controller.enqueue(encoder.encode('{"type":"token","text":"快')); 
-        controller.enqueue(encoder.encode('速"}\n{"type":"final","result":{"answer":"快速"}}\n'));
+        controller.enqueue(encoder.encode('速"}\n{"type":"reset"}\n'));
+        controller.enqueue(encoder.encode('{"type":"final","result":{"answer":"快速"}}\n'));
         controller.close();
       },
     });
@@ -33,9 +34,9 @@ describe("streamApi", () => {
       (event) => events.push(event),
     );
 
-    expect(events.map((event) => event.type)).toEqual(["token", "final"]);
+    expect(events.map((event) => event.type)).toEqual(["token", "reset", "final"]);
     expect(events[0].text).toBe("快速");
-    expect(events[1].result.answer).toBe("快速");
+    expect(events[2].result.answer).toBe("快速");
     const headers = fetchMock.mock.calls[0][1].headers;
     expect(headers.get("X-CSRF-Token")).toBe("csrf-token");
   });

@@ -102,29 +102,31 @@ class AgentConfig:
     """Bounded LangChain runtime, conversation, and evidence settings."""
 
     token_budget: int
-    tool_result_max_chars: int = 5000
-    source_snippet_chars: int = 350
-    history_max_messages: int = 6
-    history_max_chars: int = 5000
-    history_summary_max_chars: int = 1200
+    tool_result_max_chars: int = 8000
+    source_snippet_chars: int = 600
+    history_max_messages: int = 8
+    history_max_chars: int = 8000
+    history_summary_max_chars: int = 1600
     memory_ttl_seconds: int = 604800
     memory_max_sessions: int = 500
     memory_db_path: str = "./data/sessions.sqlite3"
-    recent_history_messages: int = 4
-    max_model_calls: int = 2
-    max_graph_steps: int = 24
-    max_tool_calls: int = 2
+    recent_history_messages: int = 6
+    max_model_calls: int = 3
+    max_graph_steps: int = 32
+    max_tool_calls: int = 4
     max_local_search_calls: int = 1
     max_inspect_calls: int = 1
-    max_arxiv_search_calls: int = 1
-    max_total_sources: int = 5
-    max_total_tool_result_chars: int = 8000
-    final_max_sources: int = 3
-    final_max_sources_per_paper: int = 2
-    final_reuse_max_chars: int = 4000
+    max_arxiv_search_calls: int = 2
+    max_total_sources: int = 8
+    max_total_tool_result_chars: int = 16000
+    final_max_sources: int = 5
+    final_max_sources_per_paper: int = 3
+    final_reuse_max_chars: int = 8000
     trace_value_max_chars: int = 500
     fast_local_enabled: bool = True
-    fast_local_min_confidence: float = 0.35
+    fast_local_min_confidence: float = 0.5
+    fast_local_max_sources: int = 3
+    max_forced_tool_escalations: int = 1
     prewarm_on_startup: bool = True
 
 
@@ -262,6 +264,8 @@ def _validate_settings(settings: Settings) -> None:
         "final_max_sources_per_paper",
         "final_reuse_max_chars",
         "trace_value_max_chars",
+        "fast_local_max_sources",
+        "max_forced_tool_escalations",
     ):
         if getattr(settings.agent, name) <= 0:
             raise ValueError(f"agent.{name} must be positive")

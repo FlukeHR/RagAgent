@@ -128,10 +128,13 @@ class AuthApiTests(unittest.TestCase):
             def ask(*args: object, **kwargs: object) -> AgentAnswer:
                 del args
                 sink = kwargs["token_sink"]
+                reset = kwargs["reset_sink"]
                 assert callable(sink)
+                assert callable(reset)
                 sink("快速")
-                sink("回答")
-                return AgentAnswer("快速回答", steps=["fast"], trace=[])
+                reset()
+                sink("完整回答")
+                return AgentAnswer("完整回答", steps=["escalated"], trace=[])
 
         class FakePool:
             @staticmethod
@@ -182,11 +185,11 @@ class AuthApiTests(unittest.TestCase):
 
         self.assertEqual(
             [event["type"] for event in events],
-            ["start", "token", "token", "final"],
+            ["start", "token", "reset", "token", "final"],
         )
-        self.assertEqual(events[-1]["result"]["answer"], "快速回答")
+        self.assertEqual(events[-1]["result"]["answer"], "完整回答")
         saved = self.client.get(f"/api/sessions/{conversation_id}").json()
-        self.assertEqual(saved["messages"][-1]["content"], "快速回答")
+        self.assertEqual(saved["messages"][-1]["content"], "完整回答")
 
 
 if __name__ == "__main__":

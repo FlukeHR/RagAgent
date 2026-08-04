@@ -397,6 +397,7 @@ def ask_session_stream(
                 history=history,
                 session_id=None,
                 token_sink=lambda token: events.put({"type": "token", "text": token}),
+                reset_sink=lambda: events.put({"type": "reset"}),
             )
             sources = _present_sources(context.user.user_id, result.sources)
             actions = _suggested_actions(payload.question, sources)

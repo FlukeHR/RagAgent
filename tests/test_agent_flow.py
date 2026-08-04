@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import unittest
 import json
+import time
+import unittest
 from dataclasses import replace
 from typing import Any, cast
 
@@ -262,6 +263,126 @@ class AgentFlowTests(unittest.TestCase):
         self.assertEqual(result.answer, "快速回答 [S1]")
         self.assertEqual(chunks, ["快速", "回答 [S1]"])
         self.assertEqual(result.trace[0]["type"], "fast_local")
+
+    def test_fast_refusal_resets_and_escalates_to_fresh_tool_agent(self) -> None:
+        class MarkerLLM:
+            @staticmethod
+            def stream(prompt: str, system: str = "") -> Any:
+                del prompt
+                self.assertIn("[[NEEDS_TOOLS]]", system)
+                yield "[[NEEDS_"
+                yield "TOOLS]]"
+
+        class EscalatedRuntime:
+            @staticmethod
+            def invoke(*args: object, **kwargs: Any) -> ExecutionResult:
+                del args
+                self.assertTrue(kwargs["require_fresh_tool"])
+                self.assertTrue(kwargs["force_tool_immediately"])
+                return ExecutionResult(
+                    "GRPO 使用组内相对优势估计。 [S1]",
+                    [
+                        EvidenceSource(
+                            "2402.03300",
+                            "DeepSeekMath",
+                            "Abstract",
+                            "https://arxiv.org/abs/2402.03300",
+                            snippet="GRPO estimates relative advantages within a group.",
+                            origin_tools=["search_arxiv"],
+                            citation_id="S1",
+                        ).to_dict()
+                    ],
+                    trace=[
+                        {
+                            "type": "fresh_tool_requirement",
+                            "result": "completed",
+                            "tools": ["search_arxiv"],
+                        }
+                    ],
+                )
+
+        agent = object.__new__(PaperRAGAgent)
+        agent.settings = self.settings
+        agent.llm = cast(Any, MarkerLLM())
+        agent.runtime = cast(Any, EscalatedRuntime())
+        agent.verifier = self.verifier
+        agent.selector = EvidenceSelector(self.settings)
+        agent.composer = FinalComposer(
+            self.settings, agent.llm, self.verifier, agent.selector
+        )
+        setattr(agent, "_finish_request", lambda answer, *_: answer)
+        prefetched = ToolResult(
+            "{{cite:0}} local evidence",
+            sources=[
+                EvidenceSource(
+                    "paper",
+                    "Paper",
+                    "Methods",
+                    str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+                    snippet="Related but incomplete GRPO evidence.",
+                    confidence=0.9,
+                )
+            ],
+        )
+        setattr(agent, "_prefetch_local", lambda _: prefetched)
+        chunks: list[str] = []
+        resets: list[str] = []
+
+        answer = agent._ask_low_latency(
+            "GRPO 是怎么做的？",
+            [],
+            [],
+            "",
+            0,
+            ConversationState(),
+            None,
+            time.perf_counter(),
+            chunks.append,
+            lambda: resets.append("reset"),
+        )
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(resets, ["reset"])
+        self.assertEqual(answer.status, "answered")
+        self.assertIn("组内相对优势", answer.answer)
+        self.assertTrue(
+            any(item.get("type") == "fast_local_escalation" for item in answer.trace)
+        )
+
+    def test_balanced_route_threshold_and_fast_source_cap(self) -> None:
+        self.assertEqual(self.settings.agent.fast_local_min_confidence, 0.5)
+        self.assertEqual(self.settings.agent.fast_local_max_sources, 3)
+        self.assertEqual(self.settings.llm.max_tokens, 2048)
+        self.assertTrue(self.settings.rerank.use_cross_encoder)
+
+        agent = object.__new__(PaperRAGAgent)
+        agent.settings = self.settings
+        weak = ToolResult(
+            "weak",
+            sources=[
+                EvidenceSource(
+                    "paper",
+                    "Paper",
+                    "Methods",
+                    str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+                    confidence=0.49,
+                )
+            ],
+        )
+        boundary = ToolResult(
+            "boundary",
+            sources=[
+                EvidenceSource(
+                    "paper",
+                    "Paper",
+                    "Methods",
+                    str(BASE_DIR / "data" / "papers" / "paper.pdf"),
+                    confidence=0.5,
+                )
+            ],
+        )
+        self.assertFalse(agent._use_fast_local(weak))
+        self.assertTrue(agent._use_fast_local(boundary))
 
     def test_local_generation_preserves_source_ids(self) -> None:
         prompt = (

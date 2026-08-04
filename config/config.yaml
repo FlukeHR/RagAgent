@@ -6,8 +6,8 @@ index:
   index_root: ./data/indexes
   chunk_size: 1400
   chunk_overlap: 140
-  top_k_recall: 8
-  top_n_rerank: 3
+  top_k_recall: 10
+  top_n_rerank: 4
   rrf_k: 60
   max_chunks_per_parent: 2
 
@@ -18,7 +18,7 @@ embedding:
 
 rerank:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
-  use_cross_encoder: false
+  use_cross_encoder: true
 
 retrieval:
   low_confidence_threshold: 0.0
@@ -57,7 +57,7 @@ mineru:
 
 llm:
   model_name: deepseek-v4-flash
-  max_tokens: 768
+  max_tokens: 2048
   openai_api_base: https://api.deepseek.com
   openai_api_key: ""
   request_timeout_seconds: 60
@@ -73,30 +73,32 @@ arxiv:
   request_timeout_seconds: 15
 
 agent:
-  token_budget: 12000
-  tool_result_max_chars: 5000
-  source_snippet_chars: 350
-  history_max_messages: 6
-  history_max_chars: 5000
-  history_summary_max_chars: 1200
+  token_budget: 20000
+  tool_result_max_chars: 8000
+  source_snippet_chars: 600
+  history_max_messages: 8
+  history_max_chars: 8000
+  history_summary_max_chars: 1600
   memory_ttl_seconds: 604800
   memory_max_sessions: 500
   memory_db_path: ./data/sessions.sqlite3
-  recent_history_messages: 4
-  max_model_calls: 2
-  max_graph_steps: 24
-  max_tool_calls: 2
+  recent_history_messages: 6
+  max_model_calls: 3
+  max_graph_steps: 32
+  max_tool_calls: 4
   max_local_search_calls: 1
   max_inspect_calls: 1
-  max_arxiv_search_calls: 1
-  max_total_sources: 5
-  max_total_tool_result_chars: 8000
-  final_max_sources: 3
-  final_max_sources_per_paper: 2
-  final_reuse_max_chars: 4000
+  max_arxiv_search_calls: 2
+  max_total_sources: 8
+  max_total_tool_result_chars: 16000
+  final_max_sources: 5
+  final_max_sources_per_paper: 3
+  final_reuse_max_chars: 8000
   trace_value_max_chars: 500
   fast_local_enabled: true
-  fast_local_min_confidence: 0.35
+  fast_local_min_confidence: 0.50
+  fast_local_max_sources: 3
+  max_forced_tool_escalations: 1
   prewarm_on_startup: true
 
 app:

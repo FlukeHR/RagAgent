@@ -16,6 +16,7 @@ from agent.runtime import (
     AgentExecutionError,
     AgentRunContext,
     AnswerVerificationMiddleware,
+    FreshToolRequirementMiddleware,
     InspectPaperArgs,
     LangChainAgentRuntime,
     RequestBudgetMiddleware,
@@ -143,6 +144,130 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("search_arxiv", received[0].system_message.text)
         self.assertIn("Traditional Chinese", received[0].system_message.text)
 
+    def test_fresh_tool_requirement_forces_only_arxiv_after_empty_prefetch(self) -> None:
+        context = self.context()
+        context.require_fresh_tool = True
+        context.force_tool_next = True
+        context.forced_tool_names = ("search_arxiv",)
+        request = SimpleNamespace(
+            runtime=SimpleNamespace(context=context),
+            tools=[
+                SimpleNamespace(name="search_local_papers"),
+                SimpleNamespace(name="inspect_paper"),
+                SimpleNamespace(name="search_arxiv"),
+            ],
+            tool_choice=None,
+            system_prompt="base prompt",
+        )
+
+        def override(**changes: object) -> Any:
+            return SimpleNamespace(
+                runtime=request.runtime,
+                tools=changes.get("tools", request.tools),
+                tool_choice=changes.get("tool_choice"),
+                system_message=changes.get("system_message"),
+            )
+
+        request.override = override
+        received: list[Any] = []
+
+        def handler(value: Any) -> Any:
+            received.append(value)
+            return value
+
+        FreshToolRequirementMiddleware().wrap_model_call(
+            cast(Any, request), handler
+        )
+
+        self.assertEqual(received[0].tool_choice, "required")
+        self.assertEqual(
+            [tool.name for tool in received[0].tools], ["search_arxiv"]
+        )
+        self.assertIn("must call", received[0].system_message.text)
+
+    def test_empty_prefetch_exposes_only_arxiv_before_forcing(self) -> None:
+        context = self.context()
+        context.require_fresh_tool = True
+        context.forced_tool_names = ("search_arxiv",)
+        request = SimpleNamespace(
+            runtime=SimpleNamespace(context=context),
+            tools=[
+                SimpleNamespace(name="search_local_papers"),
+                SimpleNamespace(name="inspect_paper"),
+                SimpleNamespace(name="search_arxiv"),
+            ],
+        )
+        request.override = lambda **changes: SimpleNamespace(
+            runtime=request.runtime,
+            tools=changes.get("tools", request.tools),
+        )
+        received: list[Any] = []
+
+        def handler(value: Any) -> Any:
+            received.append(value)
+            return value
+
+        FreshToolRequirementMiddleware().wrap_model_call(
+            cast(Any, request), handler
+        )
+
+        self.assertEqual(
+            [tool.name for tool in received[0].tools], ["search_arxiv"]
+        )
+
+    def test_fresh_tool_requirement_retries_resets_and_exempts_social(self) -> None:
+        middleware = FreshToolRequirementMiddleware()
+        context = self.context()
+        context.require_fresh_tool = True
+        resets: list[str] = []
+        context.reset_sink = lambda: resets.append("reset")
+        runtime = SimpleNamespace(context=context)
+
+        retry = middleware.after_model(
+            {"messages": [AIMessage(content="我不知道。")]}, runtime
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry["jump_to"], "model")
+        self.assertTrue(context.force_tool_next)
+        self.assertEqual(context.forced_tool_escalations, 1)
+        self.assertEqual(resets, ["reset"])
+
+        context.model_completed_tools.add("search_arxiv")
+        accepted = middleware.after_model(
+            {"messages": [AIMessage(content="GRPO 使用组内相对优势。 [S1]")]},
+            runtime,
+        )
+        self.assertIsNone(accepted)
+
+        social = self.context()
+        social.require_fresh_tool = True
+        direct = middleware.after_model(
+            {"messages": [AIMessage(content="[[DIRECT_NO_EVIDENCE]]你好")]},
+            SimpleNamespace(context=social),
+        )
+        self.assertIsNone(direct)
+        self.assertEqual(social.trace[-1]["result"], "direct_exemption")
+
+    def test_prefetch_does_not_count_as_model_completed_tool(self) -> None:
+        context = self.context()
+        self.adapter.execute(
+            "search_local_papers",
+            {"query": "GRPO", "prefetched": True},
+            lambda **_: ToolResult("no local evidence"),
+            context,
+        )
+        self.assertEqual(context.model_completed_tools, set())
+
+        self.adapter.execute(
+            "search_arxiv",
+            {"query": "GRPO"},
+            lambda **_: ToolResult("no arxiv evidence"),
+            context,
+        )
+        self.assertEqual(context.model_completed_tools, {"search_arxiv"})
+
     def test_runtime_uses_graph_step_budget_and_preserves_partial_error(self) -> None:
         local_llm = replace(
             self.settings.llm,
@@ -221,6 +346,65 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.answer, "answer [S1]")
         self.assertEqual(result.sources[0]["id"], "S1")
+
+    def test_grpo_without_local_evidence_records_fresh_arxiv_completion(self) -> None:
+        local_llm = replace(
+            self.settings.llm,
+            openai_api_base="http://127.0.0.1:9",
+            openai_api_key="",
+        )
+        settings = replace(self.settings, llm=local_llm)
+        stub = _StubTool()
+        runtime = LangChainAgentRuntime(
+            settings,
+            LLMClient(local_llm),
+            cast(Any, stub),
+            cast(Any, stub),
+            cast(Any, stub),
+        )
+        source = EvidenceSource(
+            "2402.03300",
+            "DeepSeekMath",
+            "Abstract",
+            "https://arxiv.org/abs/2402.03300",
+            snippet="GRPO estimates relative advantages from groups of sampled outputs.",
+        )
+
+        class ArxivGraph:
+            @staticmethod
+            def invoke(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+                context = kwargs["context"]
+                self.assertIn("did not meet the fast-answer threshold", payload["messages"][-1]["content"])
+                self.assertEqual(context.forced_tool_names, ("search_arxiv",))
+                runtime.adapter.execute(
+                    "search_arxiv",
+                    {"query": "GRPO"},
+                    lambda **_: ToolResult("{{cite:0}} GRPO evidence", sources=[source]),
+                    context,
+                )
+                return {
+                    "messages": [
+                        AIMessage(content="GRPO 使用组内相对优势估计。 [S1]")
+                    ]
+                }
+
+        runtime.graph = cast(Any, ArxivGraph())
+        result = runtime.invoke(
+            "GRPO 是怎么做的？",
+            [],
+            prefetched_local=ToolResult("no local evidence"),
+            require_fresh_tool=True,
+        )
+
+        self.assertIn("组内相对优势", result.answer)
+        self.assertEqual(result.sources[0]["id"], "S1")
+        self.assertTrue(
+            any(
+                item.get("type") == "fresh_tool_requirement"
+                and item.get("result") == "completed"
+                for item in result.trace
+            )
+        )
 
     def test_runtime_streams_final_model_text(self) -> None:
         local_llm = replace(
