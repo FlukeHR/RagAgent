@@ -8,9 +8,9 @@ from fastapi import Depends, HTTPException, Request, Response, status
 
 from config.settings import Settings, load_settings
 from services.app_store import AppStore, AuthSessionRecord, UserRecord
+from services.documents import DocumentService
+from services.evidence_agent import EvidenceAgent
 from services.security import AuthService, SecretBox, secure_compare
-from services.user_ingest import UserIngestManager
-from services.user_scope import AgentPool
 
 
 @dataclass(frozen=True)
@@ -43,13 +43,13 @@ def secret_box() -> SecretBox:
 
 
 @lru_cache(maxsize=1)
-def agent_pool() -> AgentPool:
-    return AgentPool(settings(), secret_box())
+def document_service() -> DocumentService:
+    return DocumentService(settings(), store())
 
 
 @lru_cache(maxsize=1)
-def ingest_manager() -> UserIngestManager:
-    return UserIngestManager(settings(), store(), agent_pool())
+def evidence_agent() -> EvidenceAgent:
+    return EvidenceAgent(settings(), document_service())
 
 
 def current_auth(request: Request) -> AuthContext:
@@ -73,8 +73,10 @@ def require_csrf(
     if not origin:
         raise HTTPException(status_code=403, detail="请求来源无效")
     parsed = urlparse(origin)
-    host = request.headers.get("host", "")
-    if parsed.netloc != host or parsed.scheme not in {"http", "https"}:
+    if parsed.netloc != request.headers.get("host", "") or parsed.scheme not in {
+        "http",
+        "https",
+    }:
         raise HTTPException(status_code=403, detail="请求来源无效")
     token = request.headers.get("x-csrf-token", "")
     if not token or not secure_compare(token, context.session.csrf_token):

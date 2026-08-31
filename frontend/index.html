@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FigureLens</title>
+  <style>
+    :root { color-scheme: light; font: 15px/1.55 system-ui, sans-serif; background:#f4f1ea; color:#17202a; }
+    * { box-sizing:border-box; }
+    body { margin:0; }
+    header { padding:18px 28px; background:#17202a; color:white; display:flex; justify-content:space-between; align-items:center; }
+    header strong { font-size:21px; letter-spacing:.04em; }
+    button, input, select { font:inherit; }
+    button { border:0; border-radius:8px; padding:9px 14px; background:#176b5b; color:white; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    input, select { width:100%; border:1px solid #c9c3b8; border-radius:8px; padding:9px 11px; background:white; }
+    main { max-width:1400px; margin:auto; padding:22px; }
+    .card { background:white; border:1px solid #ddd6ca; border-radius:12px; padding:18px; box-shadow:0 8px 30px #453f3510; }
+    .stack { display:grid; gap:12px; }
+    .row { display:flex; gap:10px; align-items:end; }
+    .row > * { flex:1; }
+    label { display:grid; gap:5px; color:#4d5560; }
+    #auth { max-width:460px; margin:70px auto; }
+    #workspace { display:none; grid-template-columns:320px minmax(0,1fr); gap:18px; }
+    aside { display:grid; gap:16px; align-content:start; }
+    .document { width:100%; text-align:left; background:#edf4f2; color:#173b34; margin-top:7px; }
+    .document.active { outline:2px solid #176b5b; }
+    .qa { display:grid; grid-template-columns:minmax(320px,42%) 1fr; gap:18px; }
+    #answer { white-space:pre-wrap; min-height:90px; }
+    .source { display:block; width:100%; text-align:left; background:#fff4d6; color:#5e4711; margin-top:8px; }
+    #viewer { position:relative; min-height:420px; display:grid; place-items:center; background:#272b30; border-radius:10px; overflow:hidden; }
+    #page-image { display:block; max-width:100%; max-height:75vh; }
+    #highlight { position:absolute; border:3px solid #ff4d3d; background:#ff4d3d22; pointer-events:none; display:none; }
+    .muted { color:#6c737b; font-size:13px; }
+    .error { color:#a02020; }
+    h2, h3, p { margin-top:0; }
+    @media (max-width:900px) { #workspace,.qa { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header><strong>FigureLens</strong><span id="identity"></span></header>
+  <main>
+    <section id="auth" class="card stack">
+      <h2>登录或创建本地账号</h2>
+      <label>用户名<input id="username" autocomplete="username"></label>
+      <label>密码<input id="password" type="password" autocomplete="current-password"></label>
+      <div class="row"><button id="login">登录</button><button id="register">注册</button></div>
+      <p id="auth-message" class="error"></p>
+    </section>
+
+    <section id="workspace">
+      <aside>
+        <form id="profile-form" class="card stack">
+          <h3>视觉模型</h3>
+          <label>名称<input name="name" value="Vision Model" required></label>
+          <label>API Base<input name="api_base" value="https://api.openai.com/v1" required></label>
+          <label>模型名<input name="model_name" placeholder="支持图片输入的模型" required></label>
+          <label>API Key<input name="api_key" type="password" required></label>
+          <button>保存模型配置</button>
+        </form>
+
+        <form id="upload-form" class="card stack">
+          <h3>上传 PDF</h3>
+          <input name="file" type="file" accept="application/pdf" required>
+          <button>解析页面</button>
+          <span class="muted">仅文本型 PDF，最多 30 页。</span>
+        </form>
+
+        <section class="card">
+          <h3>文档</h3>
+          <div id="documents" class="muted">暂无文档</div>
+        </section>
+      </aside>
+
+      <section class="qa">
+        <div class="card stack">
+          <h2 id="document-title">选择一个 PDF</h2>
+          <label>模型<select id="profile-select"></select></label>
+          <form id="ask-form" class="stack">
+            <label>问题<input id="question" placeholder="图 3 中哪个方法的延迟最低？" required></label>
+            <button>查找视觉证据</button>
+          </form>
+          <p id="status" class="muted"></p>
+          <div id="answer"></div>
+          <div id="sources"></div>
+        </div>
+        <div id="viewer">
+          <span id="viewer-placeholder" style="color:#bbc1c7">点击证据查看页面区域</span>
+          <img id="page-image" alt="PDF 页面证据">
+          <div id="highlight"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+  <script>
+    let csrf = "", documents = [], profiles = [], activeDocument = null;
+    const $ = (selector) => document.querySelector(selector);
+
+    async function api(path, options = {}) {
+      const headers = new Headers(options.headers || {});
+      if (!(options.body instanceof FormData) && options.body) headers.set("Content-Type", "application/json");
+      if (csrf && options.method && options.method !== "GET") headers.set("X-CSRF-Token", csrf);
+      const response = await fetch(`/api${path}`, { credentials:"same-origin", ...options, headers });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${response.status}`);
+      }
+      return response.status === 204 ? null : response.json();
+    }
+
+    async function authenticate(endpoint) {
+      try {
+        const result = await api(`/auth/${endpoint}`, {
+          method:"POST",
+          body:JSON.stringify({ username:$("#username").value, password:$("#password").value, display_name:$("#username").value })
+        });
+        enter(result);
+      } catch (error) { $("#auth-message").textContent = error.message; }
+    }
+
+    function enter(session) {
+      csrf = session.csrf_token;
+      $("#identity").textContent = session.user.display_name;
+      $("#auth").style.display = "none";
+      $("#workspace").style.display = "grid";
+      refresh();
+    }
+
+    async function refresh() {
+      [documents, profiles] = await Promise.all([api("/documents"), api("/model-profiles")]);
+      $("#profile-form").style.display = profiles.length ? "none" : "grid";
+      $("#profile-select").replaceChildren(...profiles.map((profile) => new Option(profile.name, profile.profile_id)));
+      const list = $("#documents");
+      list.replaceChildren();
+      if (!documents.length) list.textContent = "暂无文档";
+      documents.forEach((documentItem) => {
+        const button = document.createElement("button");
+        button.className = `document${activeDocument?.document_id === documentItem.document_id ? " active" : ""}`;
+        button.textContent = `${documentItem.filename} · ${documentItem.page_count} 页`;
+        button.onclick = () => { activeDocument = documentItem; $("#document-title").textContent = documentItem.filename; refresh(); };
+        list.append(button);
+      });
+    }
+
+    $("#login").onclick = () => authenticate("login");
+    $("#register").onclick = () => authenticate("register");
+
+    $("#profile-form").onsubmit = async (event) => {
+      event.preventDefault();
+      const button = event.submitter; button.disabled = true;
+      try {
+        const body = Object.fromEntries(new FormData(event.currentTarget));
+        await api("/model-profiles", { method:"POST", body:JSON.stringify(body) });
+        event.currentTarget.reset(); await refresh();
+      } catch (error) { alert(error.message); } finally { button.disabled = false; }
+    };
+
+    $("#upload-form").onsubmit = async (event) => {
+      event.preventDefault();
+      const button = event.submitter; button.disabled = true; $("#status").textContent = "正在解析 PDF…";
+      try {
+        activeDocument = await api("/documents", { method:"POST", body:new FormData(event.currentTarget) });
+        $("#document-title").textContent = activeDocument.filename;
+        event.currentTarget.reset(); await refresh();
+        $("#status").textContent = "解析完成";
+      } catch (error) { $("#status").textContent = error.message; } finally { button.disabled = false; }
+    };
+
+    $("#ask-form").onsubmit = async (event) => {
+      event.preventDefault();
+      if (!activeDocument) return alert("请先选择文档");
+      if (!profiles.length) return alert("请先保存视觉模型配置");
+      const button = event.submitter; button.disabled = true;
+      $("#status").textContent = "Agent 正在查找并核对页面证据…";
+      $("#answer").textContent = ""; $("#sources").replaceChildren();
+      try {
+        const result = await api(`/documents/${activeDocument.document_id}/ask`, {
+          method:"POST",
+          body:JSON.stringify({ question:$("#question").value, model_profile_id:$("#profile-select").value })
+        });
+        $("#answer").textContent = result.answer;
+        $("#status").textContent = result.status === "answered" ? "证据已验证" : "证据不足";
+        result.sources.forEach((source) => {
+          const item = document.createElement("button");
+          item.className = "source";
+          item.textContent = `[${source.id}] 第 ${source.page} 页 · ${source.claim}`;
+          item.onclick = () => showEvidence(source);
+          $("#sources").append(item);
+        });
+        if (result.sources[0]) showEvidence(result.sources[0]);
+      } catch (error) { $("#status").textContent = error.message; } finally { button.disabled = false; }
+    };
+
+    function showEvidence(source) {
+      const image = $("#page-image"), highlight = $("#highlight");
+      $("#viewer-placeholder").style.display = "none";
+      image.onload = () => {
+        const left = image.offsetLeft + image.clientWidth * source.bbox[0] / 1000;
+        const top = image.offsetTop + image.clientHeight * source.bbox[1] / 1000;
+        highlight.style.left = `${left}px`; highlight.style.top = `${top}px`;
+        highlight.style.width = `${image.clientWidth * (source.bbox[2] - source.bbox[0]) / 1000}px`;
+        highlight.style.height = `${image.clientHeight * (source.bbox[3] - source.bbox[1]) / 1000}px`;
+        highlight.style.display = "block";
+      };
+      image.src = `/api/documents/${activeDocument.document_id}/pages/${source.page}`;
+    }
+
+    api("/auth/session").then(enter).catch(() => {});
+  </script>
+</body>
+</html>
